@@ -292,6 +292,25 @@ poetry check
 
 * `--lock`: Verifies that `poetry.lock` exists for the current `pyproject.toml`.
 * `--strict`: Fail if check reports warnings.
+* `--installability`: Verifies, strictly from the data recorded in
+  `poetry.lock` (the lock file is never modified), that every enabled
+  dependency has an installable candidate on a grid of environments built
+  from the Python range declared in `pyproject.toml` and the target
+  platforms. Grid points where no candidate exists are reported as errors
+  and pinpoint the dependency, the marker group and the affected Python
+  version/platform; contradictory markers and dead lock entries are
+  reported as warnings (which also fail the check when `--strict` is used).
+* `--installability-grid=boundary|full`: Controls Python version sampling
+  for the installability check: `boundary` (the default) only checks the
+  endpoints of the declared range and the transition points of the Python
+  markers used in the lock, while `full` checks every minor version inside
+  the declared range. Specifying this option also enables the
+  installability check.
+* `--target-platform=<os>/<arch>`: Restricts the installability check to
+  the given target platform, e.g. `linux/x86_64`, `win32/amd64` or
+  `darwin/arm64` (repeatable). By default, platforms are derived from the
+  markers used in the lock, falling back to Linux, Windows and macOS on
+  x86_64.
 
 ## config
 

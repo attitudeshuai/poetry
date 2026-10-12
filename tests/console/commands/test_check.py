@@ -7,6 +7,7 @@ import pytest
 from poetry.factory import Factory
 from poetry.packages import Locker
 from poetry.toml import TOMLFile
+from poetry.utils._compat import tomllib
 
 
 if TYPE_CHECKING:
@@ -20,6 +21,76 @@ if TYPE_CHECKING:
     from tests.types import CommandTesterFactory
     from tests.types import FixtureDirGetter
     from tests.types import SetProjectContext
+
+
+INSTALLABILITY_PYPROJECT = """\
+[project]
+name = "myproj"
+version = "0.1.0"
+requires-python = ">=3.9,<4.0"
+dependencies = ["demo"]
+"""
+
+
+def _installability_lock() -> str:
+    return """\
+[[package]]
+name = "demo"
+version = "1.0.0"
+description = ""
+optional = false
+python-versions = "*"
+groups = ["main"]
+files = [{file = "demo-1.0.0.tar.gz", hash = "sha256:0000"}]
+
+[package.dependencies]
+lib = "*"
+
+[[package]]
+name = "lib"
+version = "1.0.0"
+description = ""
+optional = false
+python-versions = ">=3.9"
+groups = ["main"]
+markers = 'python_version < "3.11"'
+files = [{file = "lib-1.0.0.tar.gz", hash = "sha256:aaaa"}]
+
+[[package]]
+name = "lib"
+version = "2.0.0"
+description = ""
+optional = false
+python-versions = ">=3.11"
+groups = ["main"]
+markers = 'python_version >= "3.11"'
+files = [
+  {file = "lib-2.0.0-cp311-cp311-manylinux_2_17_x86_64.whl", hash = "sha256:bbbb"},
+  {file = "lib-2.0.0-cp313-cp313-manylinux_2_17_x86_64.whl", hash = "sha256:cccc"},
+]
+
+[metadata]
+lock-version = "2.1"
+python-versions = ">=3.9,<4.0"
+content-hash = "__HASH__"
+"""
+
+
+@pytest.fixture
+def installability_poetry(tmp_path: Path) -> Poetry:
+    (tmp_path / "pyproject.toml").write_text(
+        INSTALLABILITY_PYPROJECT, encoding="utf-8"
+    )
+    with (tmp_path / "pyproject.toml").open("rb") as f:
+        pyproject_data = tomllib.load(f)
+    content_hash = Locker(
+        tmp_path / "poetry.lock", pyproject_data
+    )._get_content_hash()
+    (tmp_path / "poetry.lock").write_text(
+        _installability_lock().replace("__HASH__", content_hash),
+        encoding="utf-8",
+    )
+    return Factory().create_poetry(tmp_path)
 
 
 @pytest.fixture
@@ -373,6 +444,150 @@ def test_check_readme_file_exists(
         assert (
             "Declared README file does not exist: README.md" in tester.io.fetch_error()
         )
+
+
+def test_check_installability_blocking(
+    command_tester_factory: CommandTesterFactory,
+    installability_poetry: Poetry,
+) -> None:
+    tester = command_tester_factory("check", poetry=installability_poetry)
+    status_code = tester.execute("--installability")
+
+    error_output = tester.io.fetch_error()
+    assert status_code == 1
+    assert "No installable candidate for dependency" in error_output
+    assert '"lib"' in error_output
+    assert "py3.11-win32-x86_64" in error_output
+    assert "py3.11-darwin-x86_64" in error_output
+    # the exact dependency and marker group is locatable
+    assert 'required by "demo 1.0.0" in group main' in error_output
+    # linux points are installable
+    assert "py3.11-linux" not in error_output
+
+
+def test_check_installability_full_grid_option(
+    command_tester_factory: CommandTesterFactory,
+    installability_poetry: Poetry,
+) -> None:
+    tester = command_tester_factory("check", poetry=installability_poetry)
+    # boundary sampling does not look at cp312, full grid does and the
+    # cp312 wheel is missing from lib 2.0.0
+    status_code = tester.execute("--installability-grid=full")
+    error_output = tester.io.fetch_error()
+    assert status_code == 1
+    assert "py3.12-win32-x86_64" in error_output
+
+
+def test_check_installability_target_platform_passes(
+    command_tester_factory: CommandTesterFactory,
+    installability_poetry: Poetry,
+) -> None:
+    tester = command_tester_factory("check", poetry=installability_poetry)
+    # limit the grid to linux, where every version has a wheel or sdist
+    status_code = tester.execute("--installability --target-platform=linux/x86_64")
+    assert status_code == 0
+    assert tester.io.fetch_output() == "All set!\n"
+
+
+def test_check_installability_default_off_unchanged(
+    command_tester_factory: CommandTesterFactory,
+    installability_poetry: Poetry,
+) -> None:
+    tester = command_tester_factory("check", poetry=installability_poetry)
+    # without the new options, existing behavior is preserved verbatim
+    status_code = tester.execute("")
+    assert status_code == 0
+    assert tester.io.fetch_output() == "All set!\n"
+    assert tester.io.fetch_error() == ""
+
+
+def test_check_installability_invalid_grid(
+    command_tester_factory: CommandTesterFactory,
+    installability_poetry: Poetry,
+) -> None:
+    tester = command_tester_factory("check", poetry=installability_poetry)
+    status_code = tester.execute("--installability-grid=bogus")
+    assert status_code == 1
+    assert 'Invalid value "bogus" for --installability-grid' in (
+        tester.io.fetch_error()
+    )
+
+
+def test_check_target_platform_requires_installability(
+    command_tester_factory: CommandTesterFactory,
+    installability_poetry: Poetry,
+) -> None:
+    tester = command_tester_factory("check", poetry=installability_poetry)
+    status_code = tester.execute("--target-platform=linux/x86_64")
+    assert status_code == 1
+    assert "--target-platform can only be used together with --installability" in (
+        tester.io.fetch_error()
+    )
+
+
+def test_check_installability_does_not_modify_lock(
+    command_tester_factory: CommandTesterFactory,
+    installability_poetry: Poetry,
+) -> None:
+    lock_path = installability_poetry.locker.lock
+    before = lock_path.read_bytes()
+    tester = command_tester_factory("check", poetry=installability_poetry)
+    tester.execute("--installability-grid=full")
+    assert lock_path.read_bytes() == before
+
+
+def test_check_installability_strict_fails_on_hints(
+    command_tester_factory: CommandTesterFactory,
+    tmp_path: Path,
+) -> None:
+    # demo is active everywhere but declares a dependency that can never be
+    # enabled (python_version < "3.9" while the project requires >= 3.9):
+    # this is a hint, not a blocking error
+    (tmp_path / "pyproject.toml").write_text(
+        INSTALLABILITY_PYPROJECT, encoding="utf-8"
+    )
+    with (tmp_path / "pyproject.toml").open("rb") as f:
+        pyproject_data = tomllib.load(f)
+    content_hash = Locker(
+        tmp_path / "poetry.lock", pyproject_data
+    )._get_content_hash()
+    lock = """\
+[[package]]
+name = "demo"
+version = "1.0.0"
+description = ""
+optional = false
+python-versions = "*"
+groups = ["main"]
+files = [{file = "demo-1.0.0.tar.gz", hash = "sha256:0000"}]
+
+[package.dependencies]
+oldlib = {version = "*", markers = 'python_version < "3.9"'}
+
+[[package]]
+name = "oldlib"
+version = "1.0.0"
+description = ""
+optional = false
+python-versions = "*"
+groups = ["main"]
+markers = 'python_version < "3.9"'
+files = [{file = "oldlib-1.0.0.tar.gz", hash = "sha256:dddd"}]
+
+[metadata]
+lock-version = "2.1"
+python-versions = ">=3.9,<4.0"
+content-hash = "__HASH__"
+""".replace("__HASH__", content_hash)
+    (tmp_path / "poetry.lock").write_text(lock, encoding="utf-8")
+    poetry = Factory().create_poetry(tmp_path)
+
+    tester = command_tester_factory("check", poetry=poetry)
+    assert tester.execute("--installability") == 0
+    assert "is dead and can never be installed" in tester.io.fetch_error()
+
+    tester = command_tester_factory("check", poetry=poetry)
+    assert tester.execute("--installability --strict") == 1
 
 
 @pytest.fixture(params=["project_str", "project_dict", "poetry_str", "poetry_array"])

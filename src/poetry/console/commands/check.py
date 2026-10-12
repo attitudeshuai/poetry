@@ -34,6 +34,32 @@ class CheckCommand(Command):
             None,
             "Fail if check reports warnings.",
         ),
+        option(
+            "installability",
+            None,
+            "Verify that every enabled dependency of <comment>poetry.lock</>"
+            " has an installable candidate on a grid of Python versions"
+            " derived from the declared Python range and target platforms"
+            " (boundary grid points by default). The lock file is not"
+            " modified.",
+        ),
+        option(
+            "installability-grid",
+            None,
+            "Grid sampling for the <comment>--installability</> check:"
+            ' "boundary" (default: only range endpoints and marker transition'
+            ' points) or "full" (every minor version in the declared range).',
+            flag=False,
+        ),
+        option(
+            "target-platform",
+            None,
+            "Target platform for the <comment>--installability</> check, e.g."
+            ' "linux/x86_64", "win32/amd64" or "darwin/arm64" (repeatable).'
+            " Defaults to platforms derived from the lock markers.",
+            flag=False,
+            multiple=True,
+        ),
     ]
 
     def _validate_classifiers(
@@ -184,6 +210,45 @@ class CheckCommand(Command):
                     "pyproject.toml changed significantly since poetry.lock was last generated. "
                     "Run `poetry lock` to fix the lock file."
                 )
+            ]
+
+        # Optional, read-only installability verification across an
+        # environment grid. Not enabled by default to preserve the existing
+        # `poetry check` behavior verbatim.
+        grid_mode = self.option("installability-grid")
+        if self.option("installability") or grid_mode is not None:
+            if grid_mode is None:
+                grid_mode = "boundary"
+            target_platforms = self.option("target-platform") or None
+            if grid_mode not in {"boundary", "full"}:
+                check_result["errors"] += [
+                    (
+                        f'Invalid value "{grid_mode}" for --installability-grid:'
+                        ' expected "boundary" or "full".'
+                    )
+                ]
+            elif not self.poetry.locker.is_locked():
+                check_result["errors"] += [
+                    "Installability check requested but poetry.lock was not found."
+                ]
+            else:
+                from poetry.packages.installability import InstallabilityVerifier
+
+                try:
+                    report = InstallabilityVerifier(
+                        self.poetry.locker, self.poetry.package
+                    ).verify(
+                        mode=grid_mode,
+                        target_platforms=target_platforms,
+                    )
+                except ValueError as e:
+                    check_result["errors"] += [str(e)]
+                else:
+                    check_result["errors"] += report.errors
+                    check_result["warnings"] += report.warnings
+        elif self.option("target-platform"):
+            check_result["errors"] += [
+                "--target-platform can only be used together with --installability."
             ]
 
         return_code = 0
