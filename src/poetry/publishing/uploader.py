@@ -25,6 +25,7 @@ from poetry.__version__ import __version__
 from poetry.publishing.hash_manager import HashManager
 from poetry.utils.constants import REQUESTS_TIMEOUT
 from poetry.utils.patterns import wheel_file_re
+from poetry.utils.secret_redactor import redactor
 
 
 if TYPE_CHECKING:
@@ -101,6 +102,9 @@ class Uploader:
     def auth(self, username: str | None, password: str | None) -> None:
         self._username = username
         self._password = password
+        # register CLI-provided credentials so that they are masked everywhere,
+        # including any secret value echoed back by the server
+        redactor.register(password)
 
     def make_session(self) -> requests.Session:
         session = requests.Session()
@@ -287,7 +291,9 @@ class Uploader:
                         f"HTTP Error {e.response.status_code}: "
                         f"{e.response.reason} | {e.response.content!r}"
                     )
-                    raise UploadError(message) from e
+                    # the response body may echo credentials or tokens back;
+                    # run it through the shared redactor before surfacing it
+                    raise UploadError(redactor.redact(message)) from e
 
                 raise UploadError("Error connecting to repository") from e
 

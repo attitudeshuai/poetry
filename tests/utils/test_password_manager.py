@@ -8,6 +8,13 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from keyring.credentials import SimpleCredential
+
+from poetry.utils.password_manager import SOURCE_CONFIG
+from poetry.utils.password_manager import SOURCE_ENVIRONMENT
+from poetry.utils.password_manager import SOURCE_KEYRING
+from poetry.utils.password_manager import CredentialAudit
+from poetry.utils.password_manager import CredentialLookup
 from poetry.utils.password_manager import HTTPAuthCredential
 from poetry.utils.password_manager import PasswordManager
 from poetry.utils.password_manager import PoetryKeyring
@@ -406,3 +413,242 @@ def test_disabled_keyring_never_called(
     manager.delete_http_password(repo_name="doesn't exist")
     manager.delete_http_password(repo_name="onlyuser")
     manager.get_credential("a", "b", "c", username="user")
+
+
+def test_http_auth_audit_reports_environment_source(
+    environ: None, config: Config
+) -> None:
+    os.environ["POETRY_HTTP_BASIC_FOO_USERNAME"] = "bar"
+    os.environ["POETRY_HTTP_BASIC_FOO_PASSWORD"] = "secret-password"
+
+    auth = PasswordManager(config).get_http_auth("foo")
+
+    assert auth == HTTPAuthCredential(username="bar", password="secret-password")
+    assert auth.audit.source == SOURCE_ENVIRONMENT
+    assert auth.audit.hit == CredentialLookup(
+        SOURCE_ENVIRONMENT, "POETRY_HTTP_BASIC_FOO_USERNAME", True, None
+    )
+    targets = [(lookup.source, lookup.target) for lookup in auth.audit.lookups]
+    assert targets[:2] == [
+        (SOURCE_ENVIRONMENT, "POETRY_HTTP_BASIC_FOO_USERNAME"),
+        (SOURCE_CONFIG, "http-basic.foo.username"),
+    ]
+    # the config layer was skipped because the environment variable wins
+    config_lookup = next(
+        lookup
+        for lookup in auth.audit.lookups
+        if lookup.target == "http-basic.foo.username"
+    )
+    assert config_lookup.reason == "environment variable takes precedence"
+
+
+def test_http_auth_audit_reports_config_source_with_miss_reasons(
+    config: Config, with_fail_keyring: None
+) -> None:
+    config.auth_config_source.add_property(
+        "http-basic.foo", {"username": "bar", "password": "secret-password"}
+    )
+
+    auth = PasswordManager(config).get_http_auth("foo")
+
+    assert auth.audit.source == SOURCE_CONFIG
+    env_lookups = [
+        lookup for lookup in auth.audit.lookups if lookup.source == SOURCE_ENVIRONMENT
+    ]
+    assert env_lookups and all(
+        lookup.reason == "environment variable is not set" and not lookup.hit
+        for lookup in env_lookups
+    )
+
+
+def test_http_auth_audit_reports_keyring_source(
+    config: Config,
+    with_simple_keyring: None,
+    poetry_keyring: PoetryKeyring,
+) -> None:
+    poetry_keyring.set_password("foo", "bar", "keyring-secret")
+    config.auth_config_source.add_property("http-basic.foo", {"username": "bar"})
+
+    auth = PasswordManager(config).get_http_auth("foo")
+
+    assert auth.password == "keyring-secret"
+    assert auth.audit.source == SOURCE_KEYRING
+    keyring_hit = next(
+        lookup
+        for lookup in auth.audit.lookups
+        if lookup.source == SOURCE_KEYRING and lookup.hit
+    )
+    assert keyring_hit.target == "keyring:poetry-repository-foo"
+    password_config = next(
+        lookup
+        for lookup in auth.audit.lookups
+        if lookup.target == "http-basic.foo.password"
+    )
+    assert not password_config.hit
+    assert password_config.reason == "not configured"
+
+
+def test_http_auth_audit_records_keyring_disabled(
+    config: Config,
+) -> None:
+    config.config["keyring"]["enabled"] = False
+    config.auth_config_source.add_property("http-basic.foo", {"username": "bar"})
+
+    auth = PasswordManager(config).get_http_auth("foo")
+
+    keyring_lookups = [
+        lookup for lookup in auth.audit.lookups if lookup.source == SOURCE_KEYRING
+    ]
+    assert len(keyring_lookups) == 1
+    assert not keyring_lookups[0].hit
+    assert "keyring.enabled" in (keyring_lookups[0].reason or "")
+
+
+def test_http_auth_degrades_when_keyring_read_fails(
+    config: Config,
+    with_simple_keyring: None,
+    caplog: LogCaptureFixture,
+    mocker: MockerFixture,
+) -> None:
+    config.auth_config_source.add_property("http-basic.foo", {"username": "bar"})
+    mocker.patch.object(
+        PoetryKeyring,
+        "get_password",
+        side_effect=PoetryKeyringError("backend exploded"),
+    )
+    manager = PasswordManager(config)
+
+    auth = manager.get_http_auth("foo")
+
+    assert auth.username == "bar"
+    assert auth.password is None
+    keyring_lookup = next(
+        lookup for lookup in auth.audit.lookups if lookup.source == SOURCE_KEYRING
+    )
+    assert not keyring_lookup.hit
+    assert "backend exploded" in (keyring_lookup.reason or "")
+    assert "continuing with the remaining credential sources" in caplog.text
+
+
+def test_keyring_credential_fallback_audit_records_each_service(
+    config: Config, with_erroneous_keyring: None
+) -> None:
+    manager = PasswordManager(config)
+
+    credential = manager.get_credential(
+        "https://foo.bar/simple/", "foo.bar", username="bar"
+    )
+
+    assert credential.password is None
+    keyring_lookups = [
+        lookup for lookup in credential.audit.lookups if lookup.source == SOURCE_KEYRING
+    ]
+    assert [lookup.target for lookup in keyring_lookups] == [
+        "keyring:https://foo.bar/simple/",
+        "keyring:foo.bar",
+    ]
+    assert all(lookup.reason for lookup in keyring_lookups)
+
+
+def test_keyring_credential_fallback_audit_records_hit(
+    config: Config, with_simple_keyring: None, dummy_keyring: DummyBackend
+) -> None:
+    dummy_keyring.set_default_service_credential(
+        "foo.bar", SimpleCredential("foo", "keyring-secret")
+    )
+
+    credential = PasswordManager(config).get_credential(
+        "https://foo.bar/simple/", "foo.bar"
+    )
+
+    assert credential.password == "keyring-secret"
+    assert credential.audit.source == SOURCE_KEYRING
+    assert credential.audit.hit is not None
+    assert credential.audit.hit.target == "keyring:foo.bar"
+
+
+def test_pypi_token_audit_reports_environment_source(
+    environ: None, config: Config
+) -> None:
+    os.environ["POETRY_PYPI_TOKEN_FOO"] = "env-token-value"
+
+    token, audit = PasswordManager(config)._resolve_pypi_token("foo")
+
+    assert token == "env-token-value"
+    assert audit.source == SOURCE_ENVIRONMENT
+    assert audit.hit is not None
+    assert audit.hit.target == "POETRY_PYPI_TOKEN_FOO"
+
+
+def test_pypi_token_audit_reports_keyring_source(
+    config: Config,
+    with_simple_keyring: None,
+    dummy_keyring: DummyBackend,
+) -> None:
+    dummy_keyring.set_password(
+        "poetry-repository-foo", "__token__", "keyring-token-value"
+    )
+
+    token, audit = PasswordManager(config)._resolve_pypi_token("foo")
+
+    assert token == "keyring-token-value"
+    assert audit.source == SOURCE_KEYRING
+    assert audit.hit is not None
+    assert audit.hit.target == "keyring:poetry-repository-foo"
+
+
+def test_availability_reports_reason_for_unavailable_backends(
+    with_locked_keyring: None,
+) -> None:
+    availability = PoetryKeyring.availability()
+
+    assert not availability.available
+    assert availability.backend is not None
+    assert availability.reason is not None
+
+
+def test_http_auth_audit_is_logged(
+    config: Config,
+    with_simple_keyring: None,
+    poetry_keyring: PoetryKeyring,
+    caplog: LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="poetry.utils.password_manager")
+    poetry_keyring.set_password("foo", "bar", "keyring-secret")
+    config.auth_config_source.add_property("http-basic.foo", {"username": "bar"})
+
+    PasswordManager(config).get_http_auth("foo")
+
+    audit_logs = [m for m in caplog.messages if m.startswith("Credential lookup")]
+    assert audit_logs
+    assert "keyring:poetry-repository-foo" in audit_logs[-1]
+    assert "keyring-secret" not in audit_logs[-1]
+
+
+def test_keyring_get_credential_records_locked_reason(
+    with_simple_keyring: None, mocker: MockerFixture
+) -> None:
+    from keyring.errors import KeyringLocked
+
+    mocker.patch("keyring.get_credential", side_effect=KeyringLocked())
+    audit = CredentialAudit()
+
+    credential = PoetryKeyring("poetry").get_credential("foo", audit=audit)
+
+    assert credential.password is None
+    assert audit.lookups == [
+        CredentialLookup(SOURCE_KEYRING, "keyring:foo", False, "keyring is locked")
+    ]
+
+
+def test_keyring_get_credential_without_audit_keeps_behaviour(
+    with_simple_keyring: None,
+    dummy_keyring: DummyBackend,
+) -> None:
+    dummy_keyring.set_default_service_credential(
+        "foo", SimpleCredential("user", "secret")
+    )
+
+    credential = PoetryKeyring("poetry").get_credential("foo")
+
+    assert credential == HTTPAuthCredential(username="user", password="secret")

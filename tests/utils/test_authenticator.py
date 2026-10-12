@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import logging
 import re
+import threading
 import uuid
 
 from pathlib import Path
@@ -20,7 +21,13 @@ from poetry.console.exceptions import PoetryRuntimeError
 from poetry.utils.authenticator import Authenticator
 from poetry.utils.authenticator import AuthenticatorRepositoryConfig
 from poetry.utils.authenticator import RepositoryCertificateConfig
+from poetry.utils.password_manager import SOURCE_CONFIG
+from poetry.utils.password_manager import SOURCE_KEYRING
+from poetry.utils.password_manager import SOURCE_URL
+from poetry.utils.password_manager import HTTPAuthCredential
 from poetry.utils.password_manager import PoetryKeyring
+from poetry.utils.secret_redactor import MASKED
+from poetry.utils.secret_redactor import redactor
 
 
 if TYPE_CHECKING:
@@ -916,3 +923,160 @@ def test_repository_certificate_configuration_create(
     config.merge({"certificates": {"foo": cert_config}})
 
     assert RepositoryCertificateConfig.create("foo", config) == result
+
+
+def test_authenticator_audit_reports_url_source() -> None:
+    authenticator = Authenticator()
+    credential = authenticator.get_credentials_for_url(
+        "https://foo001:url-secret@foo.bar/files/foo-0.1.0.tar.gz"
+    )
+
+    assert credential.username == "foo001"
+    assert credential.password == "url-secret"
+    assert credential.audit.source == SOURCE_URL
+    assert credential.audit.hit is not None
+    assert credential.audit.hit.target == "url"
+    # the url-provided password is registered for shared output masking
+    assert redactor.redact("leak url-secret") == f"leak {MASKED}"
+
+
+def test_authenticator_audit_reports_config_source(
+    mock_config: Config, mock_remote: None
+) -> None:
+    authenticator = Authenticator(mock_config, NullIO())
+    credential = authenticator.get_credentials_for_url(
+        "https://foo.bar/files/foo-0.1.0.tar.gz"
+    )
+
+    assert credential.password == "baz"
+    assert credential.audit.source == SOURCE_CONFIG
+    targets = [lookup.target for lookup in credential.audit.lookups]
+    assert "http-basic.foo.username" in targets
+    assert "http-basic.foo.password" in targets
+    # environment variables were checked first and recorded as misses
+    env_username = next(
+        lookup
+        for lookup in credential.audit.lookups
+        if lookup.target == "POETRY_HTTP_BASIC_FOO_USERNAME"
+    )
+    assert not env_username.hit
+    assert env_username.reason == "environment variable is not set"
+
+
+def test_authenticator_audit_merges_keyring_fallback(
+    config: Config,
+    mock_remote: None,
+    repo: dict[str, dict[str, str]],
+    http: responses.RequestsMock,
+    with_simple_keyring: None,
+    dummy_keyring: DummyBackend,
+) -> None:
+    config.merge({"repositories": repo})
+    dummy_keyring.set_default_service_credential(
+        "https://foo.bar/simple/",
+        SimpleCredential("foo", "keyring-secret"),
+    )
+
+    authenticator = Authenticator(config, NullIO())
+    credential = authenticator.get_credentials_for_url(
+        "https://foo.bar/files/foo-0.1.0.tar.gz"
+    )
+
+    assert credential.password == "keyring-secret"
+    assert credential.audit.source == SOURCE_KEYRING
+    targets = [lookup.target for lookup in credential.audit.lookups]
+    # repository-name keyring lookup was tried and missed before the url fallback
+    assert "keyring:poetry-repository-foo" in targets
+    assert "keyring:https://foo.bar/simple/" in targets
+    name_lookup = next(
+        lookup
+        for lookup in credential.audit.lookups
+        if lookup.target == "keyring:poetry-repository-foo"
+    )
+    assert not name_lookup.hit
+    assert name_lookup.reason == "no matching entry"
+
+
+def test_authenticator_audit_records_keyring_disabled_skip(
+    config: Config, mock_remote: None
+) -> None:
+    config.config["keyring"]["enabled"] = False
+    authenticator = Authenticator(config, NullIO())
+    credential = authenticator.get_credentials_for_url(
+        "https://unknown.example/files/foo-0.1.0.tar.gz"
+    )
+
+    assert credential.password is None
+    keyring_lookups = [
+        lookup for lookup in credential.audit.lookups if lookup.source == SOURCE_KEYRING
+    ]
+    assert keyring_lookups
+    assert all(not lookup.hit for lookup in keyring_lookups)
+    assert all("keyring.enabled" in (lookup.reason or "") for lookup in keyring_lookups)
+
+
+def test_authenticator_audit_is_attached_to_equivalent_credential(
+    mock_config: Config, mock_remote: None
+) -> None:
+    authenticator = Authenticator(mock_config, NullIO())
+    credential = authenticator.get_credentials_for_url(
+        "https://foo.bar/files/foo-0.1.0.tar.gz"
+    )
+
+    # audit metadata does not change credential equality semantics
+    assert credential == type(credential)(username="bar", password="baz")
+    assert credential.audit.lookups
+
+
+def test_authenticator_concurrent_credential_resolution_shares_cache(
+    mock_config: Config, mock_remote: None
+) -> None:
+    authenticator = Authenticator(mock_config, NullIO())
+    url = "https://foo.bar/files/foo-0.1.0.tar.gz"
+    results: list[HTTPAuthCredential] = []
+    errors: list[BaseException] = []
+
+    def resolve() -> None:
+        try:
+            results.append(authenticator.get_credentials_for_url(url))
+        except BaseException as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=resolve) for _ in range(20)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert not errors
+    assert len(results) == 20
+    assert all(
+        credential == HTTPAuthCredential("bar", "baz") for credential in results
+    )
+    assert all(credential.audit.source == SOURCE_CONFIG for credential in results)
+    # every thread received the same cached credential instance
+    assert len({id(credential) for credential in results}) == 1
+    cached = authenticator._credentials[url]
+    assert cached == HTTPAuthCredential("bar", "baz")
+
+
+def test_authenticator_masks_userinfo_in_connection_error(
+    mocker: MockerFixture, config: Config, http: responses.RequestsMock
+) -> None:
+    sleep = mocker.patch("time.sleep")
+    sdist_uri = "https://user:url-secret@foo.bar/files/foo-0.1.0.tar.gz"
+
+    def callback(request: requests.PreparedRequest) -> NoReturn:
+        raise requests.exceptions.ConnectionError("boom")
+
+    http.add_callback(
+        responses.GET, re.compile(r"^https?://foo\.bar"), callback=callback
+    )
+    authenticator = Authenticator(config, NullIO())
+
+    with pytest.raises(PoetryRuntimeError) as exc:
+        authenticator.request("get", sdist_uri)
+
+    assert "url-secret" not in str(exc.value)
+    assert "foo.bar" in str(exc.value)
+    assert sleep.call_count == 5

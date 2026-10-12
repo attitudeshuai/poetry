@@ -148,6 +148,42 @@ def test_uploader_properly_handles_403_errors(
     assert str(e.value) == "HTTP Error 403: Forbidden | b'Unauthorized'"
 
 
+def test_uploader_redacts_secret_echoed_by_server(
+    http: responses.RequestsMock, uploader: Uploader
+) -> None:
+    secret = "super-secret-token"
+    uploader.auth("user", secret)
+    http.post(
+        "https://foo.com",
+        status=403,
+        body=f"Forbidden: invalid credentials {secret}",
+    )
+
+    with pytest.raises(UploadError) as e:
+        uploader.upload("https://foo.com")
+
+    message = str(e.value)
+    assert secret not in message
+    assert "[REDACTED]" in message
+
+
+def test_uploader_redacts_password_in_url_echoed_by_server(
+    http: responses.RequestsMock, uploader: Uploader
+) -> None:
+    http.post(
+        "https://foo.com",
+        status=400,
+        body=(b"bad url https://user:url-secret@foo.com/upload was rejected"),
+    )
+
+    with pytest.raises(UploadError) as e:
+        uploader.upload("https://foo.com")
+
+    message = str(e.value)
+    assert "url-secret" not in message
+    assert "https://user:[REDACTED]@foo.com" in message
+
+
 def test_uploader_properly_handles_nonstandard_errors(
     http: responses.RequestsMock, uploader: Uploader
 ) -> None:

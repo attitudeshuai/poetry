@@ -11,6 +11,7 @@ from requests.utils import atomic_open
 from poetry.utils.authenticator import Authenticator
 from poetry.utils.authenticator import get_default_authenticator
 from poetry.utils.constants import REQUESTS_TIMEOUT
+from poetry.utils.secret_redactor import redactor
 
 
 if TYPE_CHECKING:
@@ -43,7 +44,7 @@ def download_file(
 
     set_indicator = False
     with Indicator.context() as update_context:
-        update_context(f"Downloading {url}")
+        update_context(redactor.redact(f"Downloading {url}"))
 
         total_size = downloader.total_size
         if total_size > 0:
@@ -59,7 +60,7 @@ def download_file(
                 percent = (fetched_size * 100) // total_size
                 if percent > last_percent:
                     last_percent = percent
-                    update_context(f"Downloading {url} {percent:3}%")
+                    update_context(redactor.redact(f"Downloading {url} {percent:3}%"))
 
 
 class Downloader:

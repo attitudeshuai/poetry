@@ -8,10 +8,13 @@ from contextlib import suppress
 from typing import TYPE_CHECKING
 
 from poetry.config.config import Config
+from poetry.utils.secret_redactor import redactor
 from poetry.utils.threading import atomic_cached_property
 
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     import keyring.backend
 
     from cleo.io.io import IO
@@ -20,14 +23,102 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# Credential source layers, in precedence order.
+SOURCE_ENVIRONMENT = "environment"
+SOURCE_CONFIG = "config"
+SOURCE_KEYRING = "keyring"
+SOURCE_URL = "url"
+
+_KEYRING_NAMESPACE = "poetry-repository"
+
+
 class PoetryKeyringError(Exception):
     pass
+
+
+@dataclasses.dataclass(frozen=True)
+class CredentialLookup:
+    """
+    A single lookup performed while resolving credentials.
+
+    ``source`` identifies the source layer (environment/config/keyring/url),
+    ``target`` what was looked up (environment variable name, config key or
+    keyring service), ``hit`` whether it supplied a value and ``reason``
+    explains why the lookup did not hit.
+    """
+
+    source: str
+    target: str
+    hit: bool
+    reason: str | None = None
+
+
+@dataclasses.dataclass
+class CredentialAudit:
+    """Ordered record of every credential lookup with its outcome."""
+
+    lookups: list[CredentialLookup] = dataclasses.field(default_factory=list)
+
+    def record(
+        self,
+        source: str,
+        target: str,
+        *,
+        hit: bool,
+        reason: str | None = None,
+    ) -> None:
+        self.lookups.append(CredentialLookup(source, target, hit, reason))
+
+    def merge(self, *audits: CredentialAudit) -> CredentialAudit:
+        for audit in audits:
+            self.lookups.extend(audit.lookups)
+        return self
+
+    @property
+    def hit(self) -> CredentialLookup | None:
+        """The first lookup that supplied a value, if any."""
+        return next((lookup for lookup in self.lookups if lookup.hit), None)
+
+    @property
+    def source(self) -> str | None:
+        """Source layer that supplied the secret value, if any.
+
+        Lookups are recorded in resolution order, so for credentials assembled
+        from several layers (e.g. a username from the config file and a password
+        from the keyring) this reports the layer of the final, decisive lookup.
+        """
+        return next(
+            (lookup.source for lookup in reversed(self.lookups) if lookup.hit),
+            None,
+        )
+
+    def describe(self) -> str:
+        parts: list[str] = []
+        for lookup in self.lookups:
+            status = "hit" if lookup.hit else "miss"
+            part = f"{lookup.source} ({lookup.target}): {status}"
+            if not lookup.hit and lookup.reason:
+                part += f" [{lookup.reason}]"
+            parts.append(part)
+        return " -> ".join(parts)
+
+
+@dataclasses.dataclass(frozen=True)
+class KeyringAvailability:
+    """Availability of the system keyring along with a diagnostic reason."""
+
+    available: bool
+    backend: str | None = None
+    reason: str | None = None
 
 
 @dataclasses.dataclass
 class HTTPAuthCredential:
     username: str | None = dataclasses.field(default=None)
     password: str | None = dataclasses.field(default=None)
+    audit: CredentialAudit = dataclasses.field(
+        default_factory=CredentialAudit, compare=False, repr=False
+    )
 
 
 class PoetryKeyring:
@@ -71,7 +162,10 @@ class PoetryKeyring:
                 io.write_line("")
 
     def get_credential(
-        self, *names: str, username: str | None = None
+        self,
+        *names: str,
+        username: str | None = None,
+        audit: CredentialAudit | None = None,
     ) -> HTTPAuthCredential:
         import keyring
 
@@ -85,17 +179,44 @@ class PoetryKeyring:
                 credential = keyring.get_credential(name, username)
             except KeyringLocked:
                 logger.debug("Keyring %s is locked", name)
+                if audit is not None:
+                    audit.record(
+                        SOURCE_KEYRING,
+                        f"keyring:{name}",
+                        hit=False,
+                        reason="keyring is locked",
+                    )
             except (KeyringError, RuntimeError):
                 logger.debug("Accessing keyring %s failed", name, exc_info=True)
+                if audit is not None:
+                    audit.record(
+                        SOURCE_KEYRING,
+                        f"keyring:{name}",
+                        hit=False,
+                        reason="keyring access failed",
+                    )
+            else:
+                if credential:
+                    if audit is not None:
+                        audit.record(SOURCE_KEYRING, f"keyring:{name}", hit=True)
+                    return HTTPAuthCredential(
+                        username=credential.username,
+                        password=credential.password,
+                        audit=audit or CredentialAudit(),
+                    )
+                if audit is not None:
+                    audit.record(
+                        SOURCE_KEYRING,
+                        f"keyring:{name}",
+                        hit=False,
+                        reason="no matching entry",
+                    )
 
-            if credential:
-                return HTTPAuthCredential(
-                    username=credential.username, password=credential.password
-                )
+        return HTTPAuthCredential(
+            username=username, password=None, audit=audit or CredentialAudit()
+        )
 
-        return HTTPAuthCredential(username=username, password=None)
-
-    def get_password(self, name: str, username: str) -> str | None:
+    def get_password(self, name: str, username: str | None) -> str | None:
         import keyring
         import keyring.errors
 
@@ -105,7 +226,8 @@ class PoetryKeyring:
             return keyring.get_password(name, username or self._EMPTY_USERNAME_KEY)
         except (RuntimeError, keyring.errors.KeyringError) as e:
             raise PoetryKeyringError(
-                f"Unable to retrieve the password for {name} from the key ring {e}"
+                f"Unable to retrieve the password for {name} from the key ring "
+                f"{self.backend_name()!r}: {e}"
             )
 
     def set_password(self, name: str, username: str, password: str) -> None:
@@ -118,7 +240,8 @@ class PoetryKeyring:
             keyring.set_password(name, username or self._EMPTY_USERNAME_KEY, password)
         except (RuntimeError, keyring.errors.KeyringError) as e:
             raise PoetryKeyringError(
-                f"Unable to store the password for {name} in the key ring: {e}"
+                f"Unable to store the password for {name} in the key ring "
+                f"{self.backend_name()!r}: {e}"
             )
 
     def delete_password(self, name: str, username: str) -> None:
@@ -130,7 +253,8 @@ class PoetryKeyring:
             keyring.delete_password(name, username or self._EMPTY_USERNAME_KEY)
         except (RuntimeError, keyring.errors.KeyringError):
             raise PoetryKeyringError(
-                f"Unable to delete the password for {name} from the key ring"
+                f"Unable to delete the password for {name} from the key ring "
+                f"{self.backend_name()!r}"
             )
 
     def get_entry_name(self, name: str) -> str:
@@ -138,7 +262,11 @@ class PoetryKeyring:
 
     @classmethod
     @functools.cache
-    def is_available(cls) -> bool:
+    def availability(cls) -> KeyringAvailability:
+        """
+        Probe the system keyring and report whether it can be used along with
+        the active backend name and, when unavailable, the reason.
+        """
         logger.debug("Checking if keyring is available")
         try:
             import keyring
@@ -146,7 +274,9 @@ class PoetryKeyring:
             import keyring.errors
         except ImportError as e:
             logger.debug("An error occurred while importing keyring: %s", e)
-            return False
+            return KeyringAvailability(
+                available=False, reason="the keyring package is not installed"
+            )
 
         def backend_name(backend: keyring.backend.KeyringBackend) -> str:
             name: str = backend.name
@@ -172,7 +302,14 @@ class PoetryKeyring:
 
         if valid_backend is None:
             logger.debug("No valid keyring backend was found")
-            return False
+            return KeyringAvailability(
+                available=False,
+                backend=backend.name,
+                reason=(
+                    "no supported keyring backend is available "
+                    f"(active backend: {backend.name!r})"
+                ),
+            )
 
         logger.debug(f"Using keyring backend {backend.name!r}")
 
@@ -183,9 +320,27 @@ class PoetryKeyring:
             logger.debug(
                 "Accessing keyring failed during availability check", exc_info=True
             )
-            return False
+            return KeyringAvailability(
+                available=False,
+                backend=valid_backend.name,
+                reason="the keyring backend is locked or not accessible",
+            )
 
-        return True
+        return KeyringAvailability(available=True, backend=valid_backend.name)
+
+    @classmethod
+    @functools.cache
+    def is_available(cls) -> bool:
+        return cls.availability().available
+
+    @staticmethod
+    def backend_name() -> str | None:
+        """Name of the currently configured keyring backend, if discoverable."""
+        with suppress(Exception):
+            import keyring
+
+            return str(keyring.get_keyring().name)
+        return None
 
 
 class PasswordManager:
@@ -203,7 +358,7 @@ class PasswordManager:
                 "Access to keyring was requested, but it is not available"
             )
 
-        return PoetryKeyring("poetry-repository")
+        return PoetryKeyring(_KEYRING_NAMESPACE)
 
     @staticmethod
     def warn_plaintext_credentials_stored() -> None:
@@ -218,6 +373,29 @@ class PasswordManager:
         else:
             self.keyring.set_password(repo_name, "__token__", token)
 
+    def _resolve_pypi_token(self, repo_name: str) -> tuple[str | None, CredentialAudit]:
+        """Get PyPi token and an audit of the sources consulted.
+
+        First checks the environment variables for a token,
+        then the configured username/password and the
+        available keyring.
+
+        :param repo_name:  Name of repository.
+        :return: Returns a token as a string if found, otherwise None.
+        """
+        audit = CredentialAudit()
+        keys: list[str] = ["pypi-token", repo_name]
+        token: str | None = self._config.get(keys)
+        self._record_config_lookup(keys, audit, present=bool(token))
+
+        if not token:
+            token = self._lookup_keyring_password(repo_name, "__token__", audit)
+
+        token = token or None
+        redactor.register(token)
+        self._log_audit(f"pypi-token.{repo_name}", audit)
+        return token, audit
+
     def get_pypi_token(self, repo_name: str) -> str | None:
         """Get PyPi token.
 
@@ -228,14 +406,7 @@ class PasswordManager:
         :param repo_name:  Name of repository.
         :return: Returns a token as a string if found, otherwise None.
         """
-        token: str | None = self._config.get(["pypi-token", repo_name])
-        if token:
-            return token
-
-        if self.use_keyring:
-            return self.keyring.get_password(repo_name, "__token__")
-        else:
-            return None
+        return self._resolve_pypi_token(repo_name)[0]
 
     def delete_pypi_token(self, repo_name: str) -> None:
         if not self.use_keyring:
@@ -246,14 +417,29 @@ class PasswordManager:
         self.keyring.delete_password(repo_name, "__token__")
 
     def get_http_auth(self, repo_name: str) -> HTTPAuthCredential:
-        username = self._config.get(["http-basic", repo_name, "username"])
-        password = self._config.get(["http-basic", repo_name, "password"])
+        audit = CredentialAudit()
 
-        if password is None and self.use_keyring:
-            password = self.keyring.get_password(repo_name, username)
+        username_keys = ["http-basic", repo_name, "username"]
+        password_keys = ["http-basic", repo_name, "password"]
+
+        username = self._config.get(username_keys)
+        self._record_config_lookup(username_keys, audit, present=username is not None)
+
+        password = self._config.get(password_keys)
+        self._record_config_lookup(password_keys, audit, present=password is not None)
+
+        if password is None:
+            password = self._lookup_keyring_password(repo_name, username, audit)
 
         # we use `or None` here to ensure that empty strings are passed as None
-        return HTTPAuthCredential(username=username or None, password=password or None)
+        credential = HTTPAuthCredential(
+            username=username or None,
+            password=password or None,
+            audit=audit,
+        )
+        redactor.register(credential.password)
+        self._log_audit(f"http-basic.{repo_name}", audit)
+        return credential
 
     def set_http_password(self, repo_name: str, username: str, password: str) -> None:
         auth = {"username": username}
@@ -280,7 +466,127 @@ class PasswordManager:
     def get_credential(
         self, *names: str, username: str | None = None
     ) -> HTTPAuthCredential:
-        if self.use_keyring:
-            return self.keyring.get_credential(*names, username=username)
+        audit = CredentialAudit()
 
-        return HTTPAuthCredential(username=username, password=None)
+        skip_reason = self._keyring_skip_reason()
+        if skip_reason is not None:
+            for name in names:
+                audit.record(
+                    SOURCE_KEYRING,
+                    f"keyring:{name}",
+                    hit=False,
+                    reason=skip_reason,
+                )
+            self._log_audit("keyring credential fallback", audit)
+            return HTTPAuthCredential(username=username, audit=audit)
+
+        credential = self.keyring.get_credential(*names, username=username, audit=audit)
+        redactor.register(credential.password)
+        self._log_audit("keyring credential fallback", audit)
+        return credential
+
+    def _keyring_skip_reason(self) -> str | None:
+        """Return the reason the keyring must be skipped, or None when usable."""
+        if not self._config.get("keyring.enabled"):
+            return "keyring disabled by keyring.enabled configuration"
+
+        availability = PoetryKeyring.availability()
+        if availability.available:
+            return None
+
+        return availability.reason or "keyring is not available"
+
+    def _lookup_keyring_password(
+        self,
+        repo_name: str,
+        username: str | None,
+        audit: CredentialAudit,
+    ) -> str | None:
+        entry_name = f"{_KEYRING_NAMESPACE}-{repo_name}"
+        target = f"keyring:{entry_name}"
+
+        skip_reason = self._keyring_skip_reason()
+        if skip_reason is not None:
+            audit.record(SOURCE_KEYRING, target, hit=False, reason=skip_reason)
+            return None
+
+        try:
+            password = self.keyring.get_password(repo_name, username)
+        except PoetryKeyringError as e:
+            # Declared policy: a keyring read failure must not crash credential
+            # resolution. Record the failure and degrade to the remaining sources.
+            reason = redactor.redact(str(e))
+            logger.warning(
+                "Keyring lookup for %s failed; continuing with the remaining "
+                "credential sources: %s",
+                entry_name,
+                reason,
+            )
+            audit.record(SOURCE_KEYRING, target, hit=False, reason=reason)
+            return None
+
+        if password is None:
+            audit.record(
+                SOURCE_KEYRING,
+                target,
+                hit=False,
+                reason="no matching entry",
+            )
+        else:
+            audit.record(SOURCE_KEYRING, target, hit=True)
+            redactor.register(password)
+
+        return password
+
+    def _record_config_lookup(
+        self,
+        keys: Sequence[str],
+        audit: CredentialAudit,
+        *,
+        present: bool = True,
+    ) -> None:
+        """Record the environment variable and config file layers for a key."""
+        env_name = "POETRY_" + "_".join(key.upper().replace("-", "_") for key in keys)
+        config_key = ".".join(keys)
+        source = self._config.source_of(keys)
+
+        if source == SOURCE_ENVIRONMENT:
+            audit.record(
+                SOURCE_ENVIRONMENT,
+                env_name,
+                hit=present,
+                reason=None if present else "environment variable is empty",
+            )
+            # an existing environment variable shadows the file configuration,
+            # even when its value is empty
+            audit.record(
+                SOURCE_CONFIG,
+                config_key,
+                hit=False,
+                reason="environment variable takes precedence",
+            )
+        elif source == SOURCE_CONFIG:
+            audit.record(
+                SOURCE_ENVIRONMENT,
+                env_name,
+                hit=False,
+                reason="environment variable is not set",
+            )
+            audit.record(
+                SOURCE_CONFIG,
+                config_key,
+                hit=present,
+                reason=None if present else "configured value is empty",
+            )
+        else:
+            audit.record(
+                SOURCE_ENVIRONMENT,
+                env_name,
+                hit=False,
+                reason="environment variable is not set",
+            )
+            audit.record(SOURCE_CONFIG, config_key, hit=False, reason="not configured")
+
+    @staticmethod
+    def _log_audit(label: str, audit: CredentialAudit) -> None:
+        logger.debug("Credential lookup for %s: %s", label, audit.describe())

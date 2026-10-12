@@ -368,6 +368,31 @@ class Config:
 
         return self.process(value)
 
+    def source_of(self, setting_name: str | Sequence[str]) -> str | None:
+        """
+        Report which configuration layer provides a scalar setting without
+        resolving or changing the setting value.
+
+        Returns ``"environment"`` when the setting is supplied via its
+        ``POETRY_*`` environment variable, ``"config"`` when it is present in
+        the merged file configuration, and ``None`` when it is unset.
+        Only scalar lookups (such as credential keys) are supported.
+        """
+        keys = split_key(setting_name)
+
+        if self._use_environment:
+            env = "POETRY_" + "_".join(k.upper().replace("-", "_") for k in keys)
+            if os.getenv(env) is not None:
+                return "environment"
+
+        value: Any = self._config
+        for key in keys:
+            if not isinstance(value, dict) or key not in value:
+                return None
+            value = value[key]
+
+        return "config"
+
     def process(self, value: Any) -> Any:
         if not isinstance(value, str):
             return value

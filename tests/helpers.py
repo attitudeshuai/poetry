@@ -368,6 +368,7 @@ def with_working_directory(source: Path, target: Path | None = None) -> Iterator
 def set_keyring_backend(backend: KeyringBackend) -> None:
     """Clears availability cache and sets the specified keyring backend."""
     PoetryKeyring.is_available.cache_clear()
+    PoetryKeyring.availability.cache_clear()
     keyring.set_keyring(backend)
 
 

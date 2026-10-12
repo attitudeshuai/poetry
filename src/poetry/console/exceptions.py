@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 from cleo.exceptions import CleoError
 
 from poetry.utils._compat import decode
+from poetry.utils.secret_redactor import redactor
 
 
 if TYPE_CHECKING:
@@ -143,7 +144,7 @@ class PoetryRuntimeError(PoetryConsoleError):
         to write.
         """
         if text := self.get_text(debug=io.is_verbose(), strip=False):
-            io.write_error_line(text)
+            io.write_error_line(redactor.redact(text))
 
     def get_text(
         self, debug: bool = False, indent: str = "", strip: bool = False

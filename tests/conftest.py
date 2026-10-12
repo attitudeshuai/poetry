@@ -49,6 +49,7 @@ from poetry.utils.env import SystemEnv
 from poetry.utils.env import VirtualEnv
 from poetry.utils.env.python import Python
 from poetry.utils.password_manager import PoetryKeyring
+from poetry.utils.secret_redactor import redactor
 from tests.helpers import MOCK_DEFAULT_GIT_REVISION
 from tests.helpers import DummyLocker
 from tests.helpers import DummyRepository
@@ -332,6 +333,15 @@ def config(
 @pytest.fixture
 def artifact_cache(config: Config) -> ArtifactCache:
     return ArtifactCache(cache_dir=config.artifacts_cache_directory)
+
+
+@pytest.fixture(autouse=True)
+def reset_secret_redactor() -> Iterator[None]:
+    # the redactor is a process-wide singleton; registered test secrets must
+    # not leak masking behaviour into other tests
+    redactor.reset()
+    yield
+    redactor.reset()
 
 
 @pytest.fixture()

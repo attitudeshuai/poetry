@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import logging
+import threading
 import time
 import urllib.parse
 
@@ -27,8 +28,11 @@ from poetry.exceptions import PoetryError
 from poetry.utils.constants import REQUESTS_TIMEOUT
 from poetry.utils.constants import RETRY_AFTER_HEADER
 from poetry.utils.constants import STATUS_FORCELIST
+from poetry.utils.password_manager import SOURCE_URL
+from poetry.utils.password_manager import CredentialAudit
 from poetry.utils.password_manager import HTTPAuthCredential
 from poetry.utils.password_manager import PasswordManager
+from poetry.utils.secret_redactor import redactor
 
 
 if TYPE_CHECKING:
@@ -111,8 +115,16 @@ class AuthenticatorRepositoryConfig:
 
         if password_manager.use_keyring:
             # fallback to url and netloc based keyring entries
-            credential = password_manager.get_credential(
+            fallback = password_manager.get_credential(
                 self.url, self.netloc, username=credential.username
+            )
+
+            # preserve the lookup order in a single audit trail
+            audit = credential.audit.merge(fallback.audit)
+            return HTTPAuthCredential(
+                username=fallback.username,
+                password=fallback.password,
+                audit=audit,
             )
 
         return credential
@@ -131,6 +143,8 @@ class Authenticator:
         self._io = io
         self._sessions_for_netloc: dict[str, requests.Session] = {}
         self._credentials: dict[str, HTTPAuthCredential] = {}
+        # guards the credentials cache, which is shared by worker threads
+        self._credentials_lock = threading.Lock()
         self._certs: dict[str, RepositoryCertificateConfig] = {}
         self._configured_repositories: (
             dict[str, AuthenticatorRepositoryConfig] | None
@@ -264,7 +278,10 @@ class Authenticator:
                 if is_last_attempt:
                     parsed_url = urllib.parse.urlsplit(url)
                     exc = PoetryRuntimeError.create(
-                        reason=f"<error>All attempts to connect to <c1>{parsed_url.netloc}</> failed.</>",
+                        reason=(
+                            "<error>All attempts to connect to "
+                            f"<c1>{_safe_netloc(parsed_url)}</> failed.</>"
+                        ),
                         exception=e,
                     )
                     exc.append(
@@ -298,7 +315,9 @@ class Authenticator:
                 continue
 
         # this should never really be hit under any sane circumstance
-        raise PoetryError(f"Failed HTTP request: {method.upper()} {url}")
+        raise PoetryError(
+            redactor.redact(f"Failed HTTP request: {method.upper()} {url}")
+        )
 
     def _get_backoff(self, response: requests.Response | None, attempt: int) -> float:
         if response is not None:
@@ -325,12 +344,17 @@ class Authenticator:
         # backend queries when packages are being downloaded from the same source
         key = repository.url
 
-        if key not in self._credentials:
-            self._credentials[key] = repository.get_http_credentials(
-                password_manager=self._password_manager
-            )
+        with self._credentials_lock:
+            if key in self._credentials:
+                return self._credentials[key]
 
-        return self._credentials[key]
+        credential = repository.get_http_credentials(
+            password_manager=self._password_manager
+        )
+
+        with self._credentials_lock:
+            # another thread may have resolved the same repository concurrently
+            return self._credentials.setdefault(key, credential)
 
     def _get_credentials_for_url(
         self, url: str, exact_match: bool = False
@@ -346,13 +370,10 @@ class Authenticator:
             return self._get_credentials_for_repository(repository=repository)
 
         # No configured repository matches: fall back to a keyring lookup by
-        # the request url and netloc.
+        # the request url and netloc. The credential carries the audit trail
+        # of the keyring lookups.
         parsed_url = urllib.parse.urlsplit(url)
-        credential = self._password_manager.get_credential(url, parsed_url.netloc)
-
-        return HTTPAuthCredential(
-            username=credential.username, password=credential.password
-        )
+        return self._password_manager.get_credential(url, parsed_url.netloc)
 
     def get_credentials_for_git_url(self, url: str) -> HTTPAuthCredential:
         parsed_url = urllib.parse.urlsplit(url)
@@ -362,35 +383,60 @@ class Authenticator:
 
         key = f"git+{url}"
 
-        if key not in self._credentials:
-            self._credentials[key] = self._get_credentials_for_url(url, True)
+        with self._credentials_lock:
+            if key in self._credentials:
+                return self._credentials[key]
 
-        return self._credentials[key]
+        credential = self._get_credentials_for_url(url, True)
+
+        with self._credentials_lock:
+            return self._credentials.setdefault(key, credential)
 
     def get_credentials_for_url(self, url: str) -> HTTPAuthCredential:
         parsed_url = urllib.parse.urlsplit(url)
         netloc = parsed_url.netloc
 
-        if url not in self._credentials:
-            if "@" not in netloc:
-                # no credentials were provided in the url, try finding the
-                # best repository configuration
-                self._credentials[url] = self._get_credentials_for_url(url)
-            else:
-                # Split from the right because that's how urllib.parse.urlsplit()
-                # behaves if more than one @ is present (which can be checked using
-                # the password attribute of urlsplit()'s return value).
-                auth, netloc = netloc.rsplit("@", 1)
-                # Split from the left because that's how urllib.parse.urlsplit()
-                # behaves if more than one : is present (which again can be checked
-                # using the password attribute of the return value)
-                user, password = auth.split(":", 1) if ":" in auth else (auth, "")
-                self._credentials[url] = HTTPAuthCredential(
-                    urllib.parse.unquote(user),
-                    urllib.parse.unquote(password),
-                )
+        with self._credentials_lock:
+            if url in self._credentials:
+                return self._credentials[url]
 
-        return self._credentials[url]
+        if "@" not in netloc:
+            # no credentials were provided in the url, try finding the
+            # best repository configuration
+            credential = self._get_credentials_for_url(url)
+        else:
+            # credentials were provided directly in the url; record this
+            # as their source and register the password for masking
+            credential = self._credentials_from_url(netloc)
+            redactor.register(credential.password)
+            logger.debug(
+                "Credential lookup for %s: %s",
+                redactor.redact_url(url),
+                credential.audit.describe(),
+            )
+
+        with self._credentials_lock:
+            return self._credentials.setdefault(url, credential)
+
+    @staticmethod
+    def _credentials_from_url(netloc: str) -> HTTPAuthCredential:
+        # Split from the right because that's how urllib.parse.urlsplit()
+        # behaves if more than one @ is present (which can be checked using
+        # the password attribute of urlsplit()'s return value).
+        auth, _ = netloc.rsplit("@", 1)
+        # Split from the left because that's how urllib.parse.urlsplit()
+        # behaves if more than one : is present (which again can be checked
+        # using the password attribute of the return value)
+        user, password = auth.split(":", 1) if ":" in auth else (auth, "")
+
+        audit = CredentialAudit()
+        audit.record(SOURCE_URL, "url", hit=True)
+
+        return HTTPAuthCredential(
+            urllib.parse.unquote(user),
+            urllib.parse.unquote(password),
+            audit=audit,
+        )
 
     def get_pypi_token(self, name: str) -> str | None:
         return self._password_manager.get_pypi_token(name)
@@ -489,6 +535,14 @@ class Authenticator:
 
 def _path_segments(path: str) -> list[str]:
     return [segment for segment in path.split("/") if segment]
+
+
+def _safe_netloc(parsed_url: urllib.parse.SplitResult) -> str:
+    """Return the netloc without any userinfo (username/password)."""
+    netloc = parsed_url.hostname or parsed_url.netloc
+    if parsed_url.port is not None:
+        netloc = f"{netloc}:{parsed_url.port}"
+    return netloc
 
 
 _authenticator: Authenticator | None = None
