@@ -282,6 +282,7 @@ lists all packages available."""
             installed=[],
             locked=locked_packages,
             io=NullIO(),
+            config=self.poetry.config,
         )
         solver.provider.load_deferred(False)
         with solver.use_environment(self.env):

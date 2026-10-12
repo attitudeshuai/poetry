@@ -182,6 +182,8 @@ class Config:
             "min-release-age": 0,
             "min-release-age-exclude": None,
             "min-release-age-exclude-source": None,
+            "trace": False,
+            "trace-path": None,
         },
         "system-git-client": False,
         "keyring": {
@@ -399,6 +401,7 @@ class Config:
             "installer.parallel",
             "installer.builtin-uninstall",
             "solver.lazy-wheel",
+            "solver.trace",
             "system-git-client",
             "keyring.enabled",
         }:

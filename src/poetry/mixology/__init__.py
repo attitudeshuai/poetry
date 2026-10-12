@@ -9,10 +9,13 @@ if TYPE_CHECKING:
     from poetry.core.packages.project_package import ProjectPackage
 
     from poetry.mixology.result import SolverResult
+    from poetry.mixology.trace import Tracer
     from poetry.puzzle.provider import Provider
 
 
-def resolve_version(root: ProjectPackage, provider: Provider) -> SolverResult:
-    solver = VersionSolver(root, provider)
+def resolve_version(
+    root: ProjectPackage, provider: Provider, tracer: Tracer | None = None
+) -> SolverResult:
+    solver = VersionSolver(root, provider, tracer)
 
     return solver.solve()

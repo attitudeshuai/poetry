@@ -509,6 +509,157 @@ poetry config solver.min-release-age-exclude-source "private-repo,https://exampl
 min-release-age-exclude-source = ["private-repo", "https://example.com/simple/"]
 ```
 
+### `solver.trace`
+
+**Type**: `boolean`
+
+**Default**: `false`
+
+**Environment Variable**: `POETRY_SOLVER_TRACE`
+
+Record a structured, ordered trace of the dependency solver's decisions to a
+JSON Lines file (one JSON object per line).
+
+When enabled, every fact introduced, version decision, propagation
+conclusion, conflict, conflict-resolution step, backtrack, no-versions
+outcome and marker split is recorded in event order. When version solving
+fails, the trace contains the terminal incompatibility together with its
+full derivation graph and the external (package-level) constraints involved,
+so the steps that caused the conflict can be located after the fact.
+
+The trace contains only deterministic fields (no timestamps, durations,
+process ids or random values), so two runs with identical inputs produce
+byte-identical files. Comparing two traces with any text `diff` shows the
+first decision at which two lock results diverged. See
+[Solver decision trace](#solver-decision-trace) for the file schema.
+
+Tracing is opt-in: when disabled, the solver behaves and performs exactly as
+without this setting. The trace records the forward solving process only; it
+is not a reverse query for why a package ended up in the final environment.
+
+The file is overwritten on every solve. By default it is written to
+`poetry-solver-trace.jsonl` in the current working directory; configure a
+different location with [`solver.trace-path`](#solvertrace-path), which is
+also the recommended way to collect traces in CI. Consider adding the
+default file name to `.gitignore`.
+
+```bash
+poetry config solver.trace true
+```
+
+```toml title="poetry.toml"
+[solver]
+trace = true
+```
+
+### `solver.trace-path`
+
+**Type**: `string`
+
+**Default**: *not set* (write to `poetry-solver-trace.jsonl` in the
+current working directory)
+
+**Environment Variable**: `POETRY_SOLVER_TRACE_PATH`
+
+Location of the JSON Lines trace written when [`solver.trace`](#solvertrace)
+is enabled. Relative paths are resolved against the current working
+directory; missing parent directories are created automatically. Every solve
+truncates and rewrites the file.
+
+```bash
+POETRY_SOLVER_TRACE=true POETRY_SOLVER_TRACE_PATH=artifacts/solver-trace.jsonl poetry lock
+```
+
+```toml title="poetry.toml"
+[solver]
+trace = true
+trace-path = "artifacts/solver-trace.jsonl"
+```
+
+If the file cannot be created or written, tracing degrades to no recording
+and a single warning is emitted; dependency resolution itself is not
+affected.
+
+### Solver decision trace
+
+The trace file is [JSON Lines](https://jsonlines.org/): each line is a
+standalone JSON object, ordered exactly as the events occurred during
+solving. Every line has the common fields:
+
+| Field | Description |
+|---|---|
+| `seq` | Global, zero-based sequence number, continuous across all runs |
+| `run` | Zero-based index of the internal solver run; `null` for solve-level events. Mutually exclusive markers may force additional runs, which all share one trace file |
+| `event` | The event type (see below) |
+| `decision_level` | Number of package decisions made when the event occurred |
+| `attempt` | The solution attempt in progress (incremented after backtracking) |
+
+Event-specific payloads are:
+
+| Event | Payload |
+|---|---|
+| `solve-start` | `schema_version`, `root` (`name`, `complete_name`, `version`) |
+| `run-start` | `overrides` (optional): the marker overrides applied to this run, as `package` and `dependencies` entries |
+| `fact` | `incompatibility` first added to the solver |
+| `decision` | selected `package`, the unsatisfied `dependency` that requested it, `preference` (`DIRECT_ORIGIN`/`NO_CHOICE`/`USE_LATEST`/`LOCKED`/`DEFAULT`), `locked`, `use_latest`, `candidate_count` |
+| `candidate-rejected` | the chosen `package` that would immediately conflict (same fields as `decision`) plus `conflicts`: the incompatibilities already satisfied |
+| `derived` | the propagated `dependency`, whether the term is `positive`, the originating `cause_id`, and the `index` of the assignment in the current run |
+| `conflict` | the `incompatibility` satisfied by the current solution |
+| `conflict-resolution` | `most_recent_term`, the `satisfier` assignment (`kind`, `decision_level`, `index`, `term`, optional `cause_id`), whether a partial `difference` exists, and the resulting combined `incompatibility` |
+| `backtrack` | `from_level`, `to_level` and `undone_decisions` (package names) |
+| `no-versions` | the `dependency` constraint for which no candidate version exists |
+| `marker-split` | the `package`, the pair of mutually exclusive `requirements`, and the two disjoint `worlds` markers; subsequent runs are started per world |
+| `failure` | the terminal `incompatibility`, the complete `graph` of combined incompatibilities (keyed by their ids), and `external`: ids of the leaf, package-level constraints |
+| `run-end` | `outcome` (`success`/`failure`/`marker-split`/`error`), `attempted_solutions`, and (on success) the final `decisions`; an `error` outcome additionally carries `error_type` and `error` |
+| `solve-end` | overall `outcome` and total number of `runs` |
+
+Incompatibilities carry a stable per-run `id` (`inc-1`, `inc-2`, ...) and
+are serialized as:
+
+```json
+{"id": "inc-3", "cause": "dependency", "terms": [{"name": "a", "complete_name": "a", "constraint": "1.0.0", "marker": "", "extras": [], "groups": ["main"], "direct_origin": false, "positive": true}, {"name": "b", "complete_name": "b", "constraint": "^2.0.0", "marker": "", "extras": [], "groups": ["main"], "direct_origin": false, "positive": false}]}
+```
+
+The `cause` is one of `dependency`, `no-versions`, `python`, `platform`,
+`root` or `conflict`. A `conflict` incompatibility additionally carries
+`derived_from` with the ids of its two parent incompatibilities; `python`
+and `platform` causes carry their version/platform details. In a
+`dependency` incompatibility, the positive term is the requiring package
+and the negative term is the requirement, which together identify the
+constraint source.
+
+Package and dependency entries always include the fields shown above
+(`name`, `complete_name`, `constraint`, `marker`, `extras`, `groups` and
+`direct_origin`; package entries additionally carry `version`,
+`full_pretty_version`, `features` and `yanked`). When a package or
+requirement comes from an explicit source, the entry also includes the
+applicable `source_type`, `source_url`, `source_reference`, `source_name`
+and `source_subdirectory` fields.
+
+A typical line for a version decision looks like:
+
+```json
+{"seq": 7, "run": 0, "event": "decision", "decision_level": 2, "attempt": 1, "package": {"name": "b", "complete_name": "b", "version": "1.2.3", "full_pretty_version": "1.2.3", "features": [], "yanked": false}, "dependency": {"name": "b", "complete_name": "b", "constraint": "^1.0", "marker": "", "extras": [], "groups": ["main"], "direct_origin": false}, "preference": "NO_CHOICE", "locked": false, "use_latest": false, "candidate_count": 1}
+```
+
+On a failed solve, start from the `failure` event: the ids in `external`
+point at the actual package requirements involved, and `graph` explains how
+they were combined. The external ids also appear in earlier `fact` events;
+internally combined incompatibilities first appear in earlier
+`conflict-resolution` events (and in the `conflict` event that started the
+failed resolution). Each id can therefore be followed through the trace to
+the exact fact, decision, derivation or conflict step that introduced it,
+without rerunning the solver.
+
+To find out why two lock results differ, save both traces and diff them;
+the first differing line is the first decision (or rejection/backtrack) at
+which the two solves diverged:
+
+```bash
+diff -u before.jsonl after.jsonl
+git diff --no-index before.jsonl after.jsonl
+```
+
 ### `system-git-client`
 
 **Type**: `boolean`

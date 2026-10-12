@@ -196,6 +196,7 @@ class Installer:
             locked_repository.packages,
             locked_repository.packages,
             self._io,
+            config=self._config,
         )
 
         # Always re-solve directory dependencies, otherwise we can't determine
@@ -243,6 +244,7 @@ class Installer:
                 self._installed_repository.packages,
                 locked_repository.packages,
                 self._io,
+                config=self._config,
             )
 
             with solver.provider.use_source_root(
@@ -316,6 +318,7 @@ class Installer:
                 locked_repository.packages,
                 NullIO(),
                 active_root_extras=self._extras,
+                config=self._config,
             )
             # Everything is resolved at this point, so we no longer need
             # to load deferred dependencies (i.e. VCS, URL and path dependencies)

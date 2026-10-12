@@ -65,6 +65,10 @@ class PartialSolution:
         return self._attempted_solutions
 
     @property
+    def assignments_count(self) -> int:
+        return len(self._assignments)
+
+    @property
     def unsatisfied(self) -> list[Dependency]:
         return [
             term.dependency

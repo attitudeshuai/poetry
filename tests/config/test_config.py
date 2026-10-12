@@ -68,6 +68,8 @@ def test_package_filter_policy_normalizes_and_matches_packages() -> None:
         ("solver.min-release-age", 0),
         ("solver.min-release-age-exclude", None),
         ("solver.min-release-age-exclude-source", None),
+        ("solver.trace", False),
+        ("solver.trace-path", None),
     ],
 )
 def test_config_get_default_value(
@@ -125,6 +127,13 @@ def test_config_get_from_environment_variable(
 ) -> None:
     os.environ[env_var] = env_value
     assert config.get(name) is value
+
+
+def test_config_get_solver_trace_path_from_environment(
+    config: Config, environ: Iterator[None]
+) -> None:
+    os.environ["POETRY_SOLVER_TRACE_PATH"] = str(Path("traces") / "solve.jsonl")
+    assert config.get("solver.trace-path") == str(Path("traces") / "solve.jsonl")
 
 
 def test_config_get_from_environment_variable_nested(

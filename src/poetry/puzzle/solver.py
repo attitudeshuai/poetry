@@ -5,6 +5,7 @@ import time
 
 from collections import defaultdict
 from contextlib import contextmanager
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from poetry.core.version.markers import AnyMarker
@@ -13,8 +14,11 @@ from poetry.core.version.markers import MultiMarker
 from poetry.core.version.markers import SingleMarker
 from poetry.core.version.markers import parse_marker
 
+from poetry.config.config import Config
 from poetry.mixology import resolve_version
 from poetry.mixology.failure import SolveFailureError
+from poetry.mixology.trace import NULL_TRACER
+from poetry.mixology.trace import FileSolverTracer
 from poetry.packages.transitive_package_info import TransitivePackageInfo
 from poetry.puzzle.exceptions import OverrideNeededError
 from poetry.puzzle.exceptions import SolverProblemError
@@ -36,6 +40,7 @@ if TYPE_CHECKING:
     from poetry.core.version.markers import BaseMarker
     from typing_extensions import Self
 
+    from poetry.mixology.trace import Tracer
     from poetry.puzzle.transaction import Transaction
     from poetry.repositories import RepositoryPool
     from poetry.utils.env import Env
@@ -56,6 +61,8 @@ class Solver:
         locked: list[Package],
         io: IO,
         active_root_extras: Collection[NormalizedName] | None = None,
+        *,
+        config: Config | None = None,
     ) -> None:
         self._package = package
         self._pool = pool
@@ -72,6 +79,19 @@ class Solver:
         )
         self._overrides: list[dict[Package, dict[str, Dependency]]] = []
 
+        self._config = config if config is not None else Config.create()
+        self._tracer: Tracer = self._create_tracer()
+
+    def _create_tracer(self) -> Tracer:
+        if not self._config.get("solver.trace"):
+            return NULL_TRACER
+
+        trace_path = self._config.get("solver.trace-path")
+        path = (
+            Path(trace_path) if trace_path else Path.cwd() / "poetry-solver-trace.jsonl"
+        )
+        return FileSolverTracer(path)
+
     @property
     def provider(self) -> Provider:
         return self._provider
@@ -86,51 +106,69 @@ class Solver:
     ) -> Transaction:
         from poetry.puzzle.transaction import Transaction
 
+        if (
+            isinstance(self._tracer, FileSolverTracer)
+            and self._tracer.io_error is not None
+        ):
+            self._io.write_error_line(
+                "<warning>Warning: unable to write the solver decision trace to"
+                f" {self._tracer.path}: {self._tracer.io_error}</warning>"
+            )
+
+        self._tracer.start_solve(self._package)
         try:
-            with self._progress(), self._provider.use_latest_for(use_latest or []):
-                start = time.time()
-                packages = self._solve()
-                # simplify markers by removing redundant information
-                for transitive_info in packages.values():
-                    for group, marker in transitive_info.markers.items():
-                        transitive_info.markers[group] = simplify_marker(
-                            marker, self._package.python_constraint
+            try:
+                with self._progress(), self._provider.use_latest_for(use_latest or []):
+                    start = time.time()
+                    packages = self._solve()
+                    # simplify markers by removing redundant information
+                    for transitive_info in packages.values():
+                        for group, marker in transitive_info.markers.items():
+                            transitive_info.markers[group] = simplify_marker(
+                                marker, self._package.python_constraint
+                            )
+                    end = time.time()
+
+                    if len(self._overrides) > 1:
+                        self._provider.debug(
+                            # ignore the warning as provider does not do interpolation
+                            f"Complete version solving took {end - start:.3f}"
+                            f" seconds with {len(self._overrides)} overrides"
                         )
-                end = time.time()
+                        self._provider.debug(
+                            # ignore the warning as provider does not do interpolation
+                            "Resolved with overrides:"
+                            f" {', '.join(f'({b})' for b in self._overrides)}"
+                        )
+            except SolverProblemError:
+                self._pool.log_age_filtered_versions(level="warning", reset=True)
+                self._tracer.finish_solve("failure")
+                raise
+            except BaseException:
+                self._tracer.finish_solve("failure")
+                raise
 
-                if len(self._overrides) > 1:
-                    self._provider.debug(
-                        # ignore the warning as provider does not do interpolation
-                        f"Complete version solving took {end - start:.3f}"
-                        f" seconds with {len(self._overrides)} overrides"
+            self._pool.log_age_filtered_versions(level="info", reset=True)
+
+            for p in packages:
+                if p.yanked:
+                    message = (
+                        f"The locked version {p.pretty_version} for"
+                        f" {p.pretty_name} is a yanked version."
                     )
-                    self._provider.debug(
-                        # ignore the warning as provider does not do interpolation
-                        "Resolved with overrides:"
-                        f" {', '.join(f'({b})' for b in self._overrides)}"
-                    )
-        except SolverProblemError:
-            self._pool.log_age_filtered_versions(level="warning", reset=True)
-            raise
+                    if p.yanked_reason:
+                        message += f" Reason for being yanked: {p.yanked_reason}"
+                    self._io.write_error_line(f"<warning>Warning: {message}</warning>")
 
-        self._pool.log_age_filtered_versions(level="info", reset=True)
-
-        for p in packages:
-            if p.yanked:
-                message = (
-                    f"The locked version {p.pretty_version} for {p.pretty_name} is a"
-                    " yanked version."
-                )
-                if p.yanked_reason:
-                    message += f" Reason for being yanked: {p.yanked_reason}"
-                self._io.write_error_line(f"<warning>Warning: {message}</warning>")
-
-        return Transaction(
-            self._locked_packages,
-            packages,
-            installed_packages=self._installed_packages,
-            root_package=self._package,
-        )
+            self._tracer.finish_solve("success")
+            return Transaction(
+                self._locked_packages,
+                packages,
+                installed_packages=self._installed_packages,
+                root_package=self._package,
+            )
+        finally:
+            self._tracer.close()
 
     @contextmanager
     def _progress(self) -> Iterator[None]:
@@ -176,8 +214,10 @@ class Solver:
         if self._provider._overrides:
             self._overrides.append(self._provider._overrides)
 
+        self._tracer.set_run_context(self._provider._overrides or None)
+
         try:
-            result = resolve_version(self._package, self._provider)
+            result = resolve_version(self._package, self._provider, self._tracer)
 
             packages = result.packages
         except OverrideNeededError as e:

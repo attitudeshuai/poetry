@@ -20,6 +20,7 @@ from poetry.mixology.partial_solution import PartialSolution
 from poetry.mixology.result import SolverResult
 from poetry.mixology.set_relation import SetRelation
 from poetry.mixology.term import Term
+from poetry.mixology.trace import NULL_TRACER
 from poetry.packages import PackageCollection
 
 
@@ -28,6 +29,7 @@ if TYPE_CHECKING:
     from poetry.core.packages.project_package import ProjectPackage
     from poetry.core.version.markers import BaseMarker
 
+    from poetry.mixology.trace import Tracer
     from poetry.packages import DependencyPackage
     from poetry.puzzle.provider import Provider
 
@@ -168,9 +170,12 @@ class VersionSolver:
     on how this solver works.
     """
 
-    def __init__(self, root: ProjectPackage, provider: Provider) -> None:
+    def __init__(
+        self, root: ProjectPackage, provider: Provider, tracer: Tracer | None = None
+    ) -> None:
         self._root = root
         self._provider = provider
+        self._tracer: Tracer = tracer if tracer is not None else NULL_TRACER
         self._dependency_cache = DependencyCache(provider)
         self._incompatibilities: dict[str, list[Incompatibility]] = {}
         self._contradicted_incompatibilities: set[Incompatibility] = set()
@@ -179,6 +184,7 @@ class VersionSolver:
         ] = collections.defaultdict(set)
         self._solution = PartialSolution()
         self._get_comp_key_cached = functools.cache(self._get_comp_key)
+        self._tracer.bind_solution(self._solution)
 
     @property
     def solution(self) -> PartialSolution:
@@ -190,9 +196,13 @@ class VersionSolver:
         or raises an error if no such set is available.
         """
         start = time.time()
+        # Local import to avoid a circular import with poetry.puzzle.
+        from poetry.puzzle.exceptions import OverrideNeededError
+
         root_dependency = Dependency(self._root.name, self._root.version)
         root_dependency.is_root = True
 
+        self._tracer.begin_run()
         self._add_incompatibility(
             Incompatibility([Term(root_dependency, False)], RootCauseError())
         )
@@ -203,7 +213,21 @@ class VersionSolver:
                 self._propagate(next)
                 next = self._choose_package_version()
 
-            return self._result()
+            result = self._result()
+        except OverrideNeededError:
+            self._tracer.run_marker_split(self._solution.attempted_solutions)
+            raise
+        except SolveFailureError:
+            # The failure event and run-end record are written by
+            # _resolve_conflict(), where the terminal incompatibility is at
+            # hand, so nothing to record here.
+            raise
+        except BaseException as e:
+            self._tracer.run_error(e, self._solution.attempted_solutions)
+            raise
+        else:
+            self._tracer.run_succeeded(result.packages, result.attempted_solutions)
+            return result
         finally:
             self._log(
                 f"Version solving took {time.time() - start:.3f} seconds.\n"
@@ -311,6 +335,12 @@ class VersionSolver:
         self._solution.derive(
             unsatisfied.dependency, not unsatisfied.is_positive(), incompatibility
         )
+        self._tracer.derived(
+            unsatisfied.dependency,
+            not unsatisfied.is_positive(),
+            incompatibility,
+            self._solution.assignments_count - 1,
+        )
 
         complete_name: str = unsatisfied.dependency.complete_name
         return complete_name
@@ -328,6 +358,7 @@ class VersionSolver:
         https://github.com/dart-lang/pub/tree/master/doc/solver.md#conflict-resolution
         """
         self._log(f"conflict: {incompatibility}")
+        self._tracer.conflict_detected(incompatibility)
 
         new_incompatibility = False
         while not incompatibility.is_failure():
@@ -393,10 +424,18 @@ class VersionSolver:
 
             # using assert to suppress mypy [union-attr]
             assert most_recent_satisfier is not None
+            assert most_recent_term is not None
+            recording = self._tracer.is_recording()
             if (
                 previous_satisfier_level < most_recent_satisfier.decision_level
                 or most_recent_satisfier.cause is None
             ):
+                if recording:
+                    backtrack_from_level = self._solution.decision_level
+                    decisions_before_backtrack = {
+                        package.complete_name for package in self._solution.decisions
+                    }
+
                 for level in range(
                     self._solution.decision_level, previous_satisfier_level, -1
                 ):
@@ -407,6 +446,19 @@ class VersionSolver:
                     self._dependency_cache.clear_level(level)
 
                 self._solution.backtrack(previous_satisfier_level)
+                if recording:
+                    undone_decisions = sorted(
+                        decisions_before_backtrack
+                        - {
+                            package.complete_name
+                            for package in self._solution.decisions
+                        }
+                    )
+                    self._tracer.backtracked(
+                        backtrack_from_level,
+                        previous_satisfier_level,
+                        undone_decisions,
+                    )
                 if new_incompatibility:
                     self._add_incompatibility(incompatibility)
 
@@ -457,6 +509,12 @@ class VersionSolver:
             )
             self._log(f'! which is caused by "{most_recent_satisfier.cause}"')
             self._log(f"! thus: {incompatibility}")
+            self._tracer.conflict_resolution(
+                most_recent_term,
+                most_recent_satisfier,
+                difference is not None,
+                incompatibility,
+            )
 
         overrides = self._recover_from_marker_conflict(incompatibility)
         if overrides is not None:
@@ -465,6 +523,7 @@ class VersionSolver:
 
             raise OverrideNeededError(*overrides)
 
+        self._tracer.run_failed(incompatibility, self._solution.attempted_solutions)
         raise SolveFailureError(incompatibility)
 
     def _recover_from_marker_conflict(
@@ -524,6 +583,7 @@ class VersionSolver:
                 if not world1.intersect(world2).is_empty():
                     continue
 
+                self._tracer.marker_split(dep1, dep2, world1, world2)
                 return self._provider.marker_split_overrides(world1)
 
         return None
@@ -654,12 +714,20 @@ class VersionSolver:
 
         dependency = self._choose_next(unsatisfied)
 
+        if self._tracer.is_recording():
+            preference = Preference(self._get_comp_key_cached(dependency)[0]).name
+            use_latest = dependency.name in self._provider.use_latest
+        else:
+            preference = ""
+            use_latest = False
+
         locked = self._provider.get_locked(dependency)
         if locked is None:
             packages = self._dependency_cache.search_for(
                 dependency, self._solution.decision_level
             )
             package = next(iter(packages), None)
+            candidate_count = len(packages)
 
             if package is None:
                 # If there are no versions that satisfy the constraint,
@@ -667,6 +735,7 @@ class VersionSolver:
                 self._add_incompatibility(
                     Incompatibility([Term(dependency, True)], NoVersionsCauseError())
                 )
+                self._tracer.no_versions(dependency)
 
                 complete_name = dependency.complete_name
                 return complete_name
@@ -674,11 +743,13 @@ class VersionSolver:
             package.dependency.transitive_marker = dependency.transitive_marker
         else:
             package = locked
+            candidate_count = 1
 
         package = self._provider.complete_package(package)
 
         conflict = False
-        for incompatibility in self._provider.incompatibilities_for(package):
+        package_incompatibilities = self._provider.incompatibilities_for(package)
+        for incompatibility in package_incompatibilities:
             self._add_incompatibility(incompatibility)
 
             # If an incompatibility is already satisfied, then selecting version
@@ -697,6 +768,35 @@ class VersionSolver:
             self._log(
                 f"selecting {package.package.complete_name}"
                 f" ({package.package.full_pretty_version})"
+            )
+            self._tracer.decision_made(
+                package.package,
+                dependency,
+                preference,
+                locked is not None,
+                use_latest,
+                candidate_count,
+            )
+        elif self._tracer.is_recording():
+            # Re-evaluate the (read-only) conflict predicate only for the
+            # trace; the solving loop above keeps its original short-circuit.
+            conflicting_incompatibilities = [
+                incompatibility
+                for incompatibility in package_incompatibilities
+                if all(
+                    term.dependency.complete_name == dependency.complete_name
+                    or self._solution.satisfies(term)
+                    for term in incompatibility.terms
+                )
+            ]
+            self._tracer.candidate_rejected(
+                package.package,
+                dependency,
+                preference,
+                locked is not None,
+                use_latest,
+                candidate_count,
+                conflicting_incompatibilities,
             )
 
         complete_name = dependency.complete_name
@@ -717,6 +817,7 @@ class VersionSolver:
     def _add_incompatibility(self, incompatibility: Incompatibility) -> None:
         self._log(f"fact: {incompatibility}")
 
+        already_indexed = False
         for term in incompatibility.terms:
             if term.dependency.complete_name not in self._incompatibilities:
                 self._incompatibilities[term.dependency.complete_name] = []
@@ -725,11 +826,17 @@ class VersionSolver:
                 incompatibility
                 in self._incompatibilities[term.dependency.complete_name]
             ):
+                already_indexed = True
                 continue
 
             self._incompatibilities[term.dependency.complete_name].append(
                 incompatibility
             )
+
+        # An incompatibility is indexed under every package its terms refer
+        # to; it is recorded as a fact exactly once, on its first addition.
+        if not already_indexed:
+            self._tracer.fact_added(incompatibility)
 
     def _log(self, text: str) -> None:
         self._provider.debug(text, self._solution.attempted_solutions)
