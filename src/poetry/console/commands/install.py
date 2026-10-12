@@ -58,6 +58,14 @@ class InstallCommand(InstallerCommand):
             None,
             "Compile Python source files to bytecode.",
         ),
+        option(
+            "resume",
+            None,
+            "Continue an interrupted or failed installation recorded for this"
+            " project and environment. Operations already completed and"
+            " verified in the environment are skipped; everything else is"
+            " executed again. No rollback is performed.",
+        ),
     ]
 
     help = """\
@@ -170,6 +178,7 @@ you can set the "package-mode" to false in your pyproject.toml file.
         self.installer.requires_synchronization(self._with_synchronization)
         self.installer.executor.enable_bytecode_compilation(self.option("compile"))
         self.installer.verbose(self.io.is_verbose())
+        self.installer.resume(bool(self.option("resume")))
 
         return_code = self.installer.run()
 

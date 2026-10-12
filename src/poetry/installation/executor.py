@@ -4,6 +4,7 @@ import csv
 import functools
 import itertools
 import json
+import logging
 import threading
 
 from collections import defaultdict
@@ -18,6 +19,23 @@ from poetry.core.packages.utils.link import Link
 from poetry.console.exceptions import PoetryRuntimeError
 from poetry.installation.chef import Chef
 from poetry.installation.chooser import Chooser
+from poetry.installation.journal import OP_COMPLETED
+from poetry.installation.journal import OP_FAILED
+from poetry.installation.journal import OP_INTERRUPTED
+from poetry.installation.journal import OP_RUNNING
+from poetry.installation.journal import OP_SKIPPED
+from poetry.installation.journal import PHASE_INSTALL
+from poetry.installation.journal import PHASE_OLD_REMOVED
+from poetry.installation.journal import PHASE_PREPARE
+from poetry.installation.journal import PHASE_REMOVE_OLD
+from poetry.installation.journal import PHASE_UNINSTALL
+from poetry.installation.journal import RUN_COMPLETED
+from poetry.installation.journal import RUN_FAILED
+from poetry.installation.journal import RUN_INTERRUPTED
+from poetry.installation.journal import InstallJournal
+from poetry.installation.journal import JournalStore
+from poetry.installation.journal import operation_key
+from poetry.installation.journal import verify_operation
 from poetry.installation.operations import Install
 from poetry.installation.operations import Uninstall
 from poetry.installation.operations import Update
@@ -54,6 +72,9 @@ if TYPE_CHECKING:
     from poetry.utils.env import Env
 
 
+logger = logging.getLogger(__name__)
+
+
 def _package_get_name(package: Package) -> str | None:
     if url := package.repository_url:
         return Git.get_name_from_source_url(url)
@@ -71,12 +92,19 @@ class Executor:
         disable_cache: bool = False,
         *,
         build_constraints: Mapping[NormalizedName, list[Dependency]] | None = None,
+        project_path: Path | None = None,
+        resume: bool = False,
     ) -> None:
         self._env = env
         self._io = io
+        self._config = config
         self._dry_run = False
         self._enabled = True
         self._verbose = False
+        self._project_path = (
+            project_path.expanduser().resolve() if project_path is not None else None
+        )
+        self._resume_requested = resume
         self._wheel_installer = WheelInstaller(self._env)
         self._build_constraints = build_constraints or {}
         self._use_builtin_uninstall: bool = config.get(
@@ -106,6 +134,14 @@ class Executor:
         self._lock = threading.Lock()
         self._shutdown = False
         self._hashes: dict[str, str] = {}
+
+        # Persistent execution record for the current batch (if any)
+        self._journal: InstallJournal | None = None
+        self._journal_seq: dict[str, int] = {}
+        self._journal_obj_seq: dict[int, int] = {}
+        self._journal_failure = False
+        self._journal_interrupt = False
+        self._resumed_run: InstallJournal | None = None
 
         # Cache whether decorated output is supported.
         # https://github.com/python-poetry/cleo/issues/423
@@ -151,6 +187,19 @@ class Executor:
 
         return self
 
+    def resume(self, resume: bool = True) -> Executor:
+        """
+        Continue a previous incomplete installation instead of running the
+        whole batch again.
+        """
+        self._resume_requested = resume
+
+        return self
+
+    @property
+    def journal(self) -> InstallJournal | None:
+        return self._journal
+
     def enable_bytecode_compilation(self, enable: bool = True) -> None:
         self._wheel_installer.enable_bytecode_compilation(enable)
 
@@ -158,6 +207,17 @@ class Executor:
         for job_type in self._executed:
             self._executed[job_type] = 0
             self._skipped[job_type] = 0
+        self._journal_failure = False
+        self._journal_interrupt = False
+        self._journal = None
+        self._journal_seq = {}
+        self._journal_obj_seq = {}
+        self._resumed_run = None
+
+        if self._journal_is_active(operations):
+            if self._resume_requested:
+                self._resume_operations(operations)
+            self._start_journal(operations)
 
         if operations and (self._enabled or self._dry_run):
             self._display_summary(operations)
@@ -235,6 +295,7 @@ class Executor:
 
             except KeyboardInterrupt:
                 self._shutdown = True
+                self._journal_interrupt = True
 
             if self._shutdown:
                 self._executor.shutdown(wait=True, cancel_futures=True)
@@ -251,7 +312,155 @@ class Executor:
             )
             self._io.write_error_line(f"<warning>Warning: {warning}</warning>")
 
+        self._finish_journal()
+
         return 1 if self._shutdown else 0
+
+    def _journal_is_active(self, operations: list[Operation]) -> bool:
+        return bool(
+            operations and self._enabled and not self._dry_run
+        )
+
+    def _journal_store(self) -> JournalStore:
+        cache_dir = Path(self._config.get("cache-dir")).expanduser()
+        return JournalStore(
+            cache_dir / "journal", self._env.path, self._project_path
+        )
+
+    def _start_journal(self, operations: list[Operation]) -> None:
+        try:
+            store = self._journal_store()
+            self._journal = store.create_run(
+                env=self._env,
+                project_path=self._project_path,
+                operations=operations,
+                resumed_from=(
+                    self._resumed_run.run_id if self._resumed_run else None
+                ),
+            )
+            self._journal_seq = {
+                operation_key(operation): seq
+                for seq, operation in enumerate(operations)
+            }
+            self._journal_obj_seq = {
+                id(operation): seq for seq, operation in enumerate(operations)
+            }
+        except Exception:
+            # Recording must never break an installation.
+            logger.debug("Could not create installation journal", exc_info=True)
+            self._journal = None
+            self._journal_seq = {}
+            self._journal_obj_seq = {}
+
+    def _resume_operations(self, operations: list[Operation]) -> None:
+        """
+        Mark operations already completed *and* verified in the environment as
+        skipped, so a resumed run only does the remaining work.
+        """
+        try:
+            previous = self._journal_store().latest_incomplete_run()
+        except Exception:
+            logger.debug("Could not look up installation journal", exc_info=True)
+            return
+
+        if previous is None:
+            return
+
+        # Remember the record even if nothing can be skipped, so a run that
+        # completes the same plan can remove the stale record afterwards.
+        self._resumed_run = previous
+
+        completed = previous.completed_keys()
+        if not completed:
+            return
+
+        for operation in operations:
+            if operation.skipped:
+                continue
+            if operation_key(operation) not in completed:
+                continue
+            if verify_operation(operation, self._env) is not True:
+                # Not actually present in the environment: execute it again.
+                continue
+            operation.skip(
+                f"Already completed in a previous run ({previous.run_id})"
+            )
+
+    def _journal_update(
+        self,
+        operation: Operation,
+        *,
+        status: str | None = None,
+        phase: str | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        if self._journal is None:
+            return
+        seq = self._journal_obj_seq.get(id(operation))
+        if seq is None:
+            seq = self._journal_seq.get(operation_key(operation))
+        if seq is None:
+            return
+        try:
+            self._journal.update_operation(seq, status=status, phase=phase, error=error)
+        except Exception:
+            logger.debug("Could not update installation journal", exc_info=True)
+
+    def _finish_journal(self) -> None:
+        journal = self._journal
+        if journal is None:
+            return
+
+        try:
+            if self._journal_failure:
+                journal.finish(RUN_FAILED)
+                self._write_journal_report(journal, interrupted=False)
+            elif self._journal_interrupt:
+                journal.finish(RUN_INTERRUPTED)
+                self._write_journal_report(journal, interrupted=True)
+            else:
+                journal.finish(RUN_COMPLETED)
+                # The gap is closed; this run's record is no longer needed.
+                journal.discard()
+                # Remove the resumed record only if this run covered the same
+                # plan, so records of concurrent runs with different plans are
+                # never touched.
+                if (
+                    self._resumed_run is not None
+                    and self._resumed_run.plan_keys() <= journal.plan_keys()
+                ):
+                    self._resumed_run.discard()
+        except Exception:
+            logger.debug("Could not finalize installation journal", exc_info=True)
+
+    def _write_journal_report(
+        self, journal: InstallJournal, *, interrupted: bool
+    ) -> None:
+        report = journal.reconcile(self._env)
+        pending = report.render_pending()
+
+        self._io.write_error_line("")
+        if interrupted:
+            self._io.write_error_line(
+                "<warning>Installation was cancelled before all operations"
+                " completed.</>"
+            )
+        else:
+            self._io.write_error_line(
+                "<error>Installation did not complete.</> The facts recorded"
+                " below describe the gap between the plan and the environment;"
+                " nothing was rolled back."
+            )
+
+        if pending:
+            self._io.write_error_line(pending)
+
+        self._io.write_error_line(f"Record: <comment>{journal.path}</>")
+        self._io.write_error_line(
+            "Re-run the command with <info>--resume</> to continue from the"
+            " last completed operation; packages already completed and"
+            " verified in the environment are not reinstalled."
+        )
 
     def _write(self, operation: Operation, line: str) -> None:
         if not self.supports_fancy_output() or not self._should_write_operation(
@@ -274,6 +483,10 @@ class Executor:
     def _execute_operation(self, operation: Operation) -> None:
         if self._shutdown:
             return
+
+        if not operation.skipped:
+            self._journal_update(operation, status=OP_RUNNING)
+
         try:
             op_message = self.get_operation_message(operation)
             if self.supports_fancy_output():
@@ -313,7 +526,14 @@ class Executor:
             # error to be picked up by the error handler.
             if result == -2:
                 raise KeyboardInterrupt
+
+            if operation.skipped:
+                self._journal_update(operation, status=OP_SKIPPED)
+            else:
+                self._journal_update(operation, status=OP_COMPLETED)
         except Exception as e:  # noqa: BLE001
+            self._journal_failure = True
+            self._journal_update(operation, status=OP_FAILED, error=e)
             try:
                 from cleo.ui.exception_trace import ExceptionTrace
 
@@ -403,6 +623,8 @@ class Executor:
                     self._shutdown = True
 
         except KeyboardInterrupt:
+            self._journal_interrupt = True
+            self._journal_update(operation, status=OP_INTERRUPTED)
             try:
                 message = (
                     "  <warning>-</warning>"
@@ -580,10 +802,13 @@ class Executor:
         message = f"  <fg=blue;options=bold>-</> {op_msg}: <info>Removing...</info>"
         self._write(operation, message)
 
+        self._journal_update(operation, phase=PHASE_UNINSTALL)
         return self._remove(operation.package)
 
     def _install(self, operation: Install | Update) -> int:
         package = operation.package
+
+        self._journal_update(operation, phase=PHASE_PREPARE)
 
         cleanup_archive: bool = False
         if package.source_type == "git":
@@ -612,10 +837,16 @@ class Executor:
                 # Uninstall the old version first. If this fails, the install is
                 # aborted so the new version is not installed over the old one.
                 assert isinstance(operation, Update)
+                self._journal_update(operation, phase=PHASE_REMOVE_OLD)
                 result_code = self._remove(operation.initial_package)
                 if result_code != 0:
                     return result_code
+                # The old version is gone from the environment at this point;
+                # record it so an interruption can be reported as
+                # "removed, but not reinstalled".
+                self._journal_update(operation, phase=PHASE_OLD_REMOVED)
 
+            self._journal_update(operation, phase=PHASE_INSTALL)
             self._wheel_installer.install(archive)
         finally:
             if cleanup_archive:

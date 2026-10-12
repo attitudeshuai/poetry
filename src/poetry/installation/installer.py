@@ -75,6 +75,7 @@ class Installer:
                 self._io,
                 disable_cache=disable_cache,
                 build_constraints=build_constraints,
+                project_path=self._locker.lock.parent,
             )
 
         self._executor = executor
@@ -144,6 +145,15 @@ class Installer:
 
     def update(self, update: bool = True) -> Installer:
         self._update = update
+
+        return self
+
+    def resume(self, resume: bool = True) -> Installer:
+        """
+        Continue a previous incomplete installation: operations already
+        completed and verified in the environment are skipped.
+        """
+        self._executor.resume(resume)
 
         return self
 

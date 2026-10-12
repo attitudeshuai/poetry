@@ -74,6 +74,7 @@ COMMANDS = [
     "cache list",
     # Debug commands
     "debug info",
+    "debug journal",
     "debug resolve",
     "debug tags",
     # Env commands
