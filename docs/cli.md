@@ -266,12 +266,45 @@ To only remove a specific package from a cache, you have to specify the cache en
 poetry cache clear PyPI:requests:2.24.0
 ```
 
+The cache is split into categories: `repositories` (package metadata and HTTP
+caches) and `artifacts` (downloaded archives and built wheels). The forms above
+only operate on repository metadata. To remove artifacts as well, or to clean
+selectively, combine `--all` with the following options:
+
+* `--category <artifacts|repositories>`: limit the command to one category
+  (without it, both categories are covered).
+* `--older-than <duration>`: only remove entries not used for the given
+  duration, e.g. `30d` (units: `s`, `m`, `h`, `d`, `w`).
+* `--larger-than <size>`: only remove entries of at least the given size, e.g.
+  `50MB`.
+* `--shrink-to <size>`: evict least recently used entries until the category
+  uses at most the given size, e.g. `200MB`.
+* `--dry-run`: show what would be removed without removing anything.
+
+For example, to remove artifacts older than 30 days:
+
+```bash
+poetry cache clear --all --category artifacts --older-than 30d
+```
+
 ### cache list
 
 The `cache list` command lists Poetry's available caches.
 
 ```bash
 poetry cache list
+```
+
+### cache stats
+
+The `cache stats` command shows, for each cache category, the number of
+entries, the total size, the number of expired entries, the configured maximum
+size and eviction policy, and the number of entries currently held in
+quarantine. Pass `--json` to get the statistics as machine readable JSON.
+
+```bash
+poetry cache stats
+poetry cache stats --json
 ```
 
 ## check

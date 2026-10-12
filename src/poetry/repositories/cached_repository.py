@@ -10,6 +10,7 @@ from poetry.core.constraints.version import parse_constraint
 
 from poetry.config.config import Config
 from poetry.repositories.repository import Repository
+from poetry.utils.cache import CacheGovernor
 from poetry.utils.cache import FileCache
 
 
@@ -29,8 +30,16 @@ class CachedRepository(Repository, ABC):
     ) -> None:
         super().__init__(name)
         self._disable_cache = disable_cache
-        self._cache_dir = (config or Config.create()).repository_cache_directory / name
-        self._release_cache: FileCache[dict[str, Any]] = FileCache(path=self._cache_dir)
+        repository_config = config or Config.create()
+        self._cache_dir = repository_config.repository_cache_directory / name
+        # The governor is shared across all per-repository caches since they
+        # all live in the same "repositories" cache category.
+        self._release_cache: FileCache[dict[str, Any]] = FileCache(
+            path=self._cache_dir,
+            governor=CacheGovernor.for_category(
+                repository_config, CacheGovernor.REPOSITORIES
+            ),
+        )
 
     @abstractmethod
     def _get_release_info(

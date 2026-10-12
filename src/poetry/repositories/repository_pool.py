@@ -13,6 +13,7 @@ from poetry.repositories.cached_repository import CachedRepository
 from poetry.repositories.exceptions import PackageNotFoundError
 from poetry.repositories.repository import Repository
 from poetry.utils.cache import ArtifactCache
+from poetry.utils.cache import CacheGovernor
 
 
 if TYPE_CHECKING:
@@ -50,8 +51,10 @@ class RepositoryPool(AbstractRepository):
         for repository in repositories:
             self.add_repository(repository)
 
+        pool_config = config or Config.create()
         self._artifact_cache = ArtifactCache(
-            cache_dir=(config or Config.create()).artifacts_cache_directory
+            cache_dir=pool_config.artifacts_cache_directory,
+            governor=CacheGovernor.for_category(pool_config, CacheGovernor.ARTIFACTS),
         )
 
     @staticmethod

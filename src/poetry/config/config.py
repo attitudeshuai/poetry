@@ -151,6 +151,10 @@ _default_config: Config | None = None
 class Config:
     default_config: ClassVar[dict[str, Any]] = {
         "cache-dir": str(DEFAULT_CACHE_DIR),
+        # Per-category capacity governance is opt-in: categories only get
+        # max-size/policy settings through user configuration, so with the
+        # defaults below cache expiration and cleanup behave as before.
+        "cache": {"categories": {}},
         "data-dir": str(data_dir()),
         "virtualenvs": {
             "create": True,

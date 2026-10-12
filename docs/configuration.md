@@ -192,6 +192,49 @@ Defaults to one of the following directories:
 - Windows: `C:\Users\<username>\AppData\Local\pypoetry\Cache`
 - Unix:    `~/.cache/pypoetry`
 
+### `cache.categories.<name>.max-size`
+
+**Type**: `string` (size, e.g. `500 MB` or `1 GiB`) or `int` (bytes)
+
+Sets a capacity limit for a cache category. Two categories are managed:
+
+- `artifacts`: downloaded archives and built wheels (`{cache-dir}/artifacts`).
+- `repositories`: repository metadata and HTTP caches
+  (`{cache-dir}/cache/repositories`).
+
+When a write pushes a category beyond its limit, Poetry evicts expired entries
+first and then the least recently used entries until the category fits again.
+Entries written within the last 60 seconds and entries currently in use are
+never evicted, so ongoing downloads and reads are not interrupted. Every
+eviction is recorded in `<category>/.poetry-cache/events.jsonl`.
+
+Corrupt entries are moved to `<category>/.poetry-cache/quarantine/` (and counted
+by `poetry cache stats`) instead of being deleted silently.
+
+Sizes accept plain byte counts or units (`B`, `KB/MB/GB/TB` are decimal,
+`KiB/MiB/GiB/TiB` binary). If no limit is declared for a category the cache
+keeps its previous behavior exactly.
+
+Example:
+
+```toml
+[cache.categories.artifacts]
+max-size = "1 GiB"
+
+[cache.categories.repositories]
+max-size = "500 MiB"
+```
+
+### `cache.categories.<name>.policy`
+
+**Type**: `string`
+
+**Default**: `lru`
+
+Selects the eviction strategy applied when the category exceeds its
+[`max-size`](#cachecategoriesnamemax-size). Currently only `lru`
+(least recently used) is supported.
+
 ### `data-dir`
 
 **Type**: `string`

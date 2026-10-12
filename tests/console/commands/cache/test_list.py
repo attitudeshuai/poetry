@@ -42,3 +42,16 @@ No caches found
 """
 
     assert tester.io.fetch_error() == expected
+
+
+def test_cache_list_skips_hidden_dirs(
+    tester: CommandTester, repository_cache_dir: Path
+) -> None:
+    (repository_cache_dir / "repo1").mkdir(parents=True)
+    (repository_cache_dir / ".poetry-cache").mkdir()
+
+    tester.execute()
+
+    output = tester.io.fetch_output()
+    assert "repo1\n" in output
+    assert ".poetry-cache" not in output
